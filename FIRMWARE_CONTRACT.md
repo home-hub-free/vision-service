@@ -16,7 +16,10 @@ today — nothing else is blocked on it.
   detection (~1–2 FPS, useless for ID).
 - **Brownout is the #1 field failure.** Require a solid 5V/2A supply + short leads;
   consider `WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0)`. Document for whoever mounts it.
-- **OTA caveat:** the pull-based OTA core does NOT cover ESP32/cam — USB-flash these.
+- **OTA:** supported (as of cam fw 20260628.2). The dumb-MJPEG build is ~970 KB, so it
+  fits a dual-OTA partition table (`min_spiffs.csv`) and the shared core's pull-based
+  OTA lands. **One** USB flash is still needed to lay that partition table down (OTA
+  can't repartition); every update after is OTA via `./hub publish --bump camera`.
 
 ## 2. Transport — stock HTTP MJPEG (§3.2)
 Use the canonical `esp_camera` + `camera_httpd` server. Endpoints (the box's contract):
@@ -31,8 +34,11 @@ Use the canonical `esp_camera` + `camera_httpd` server. Endpoints (the box's con
 - **Single consumer.** The cam handles ~1 client. The **vision-service is the only
   thing that opens `/stream`**; the dashboard views via the vision-service
   (`/vision/stream/<id>`), never the cam. State this loudly in the firmware README.
-- Sensor defaults to start with: `FRAMESIZE_SVGA` (or VGA), `jpeg_quality 10–12`,
-  `fb_count = 2` (PSRAM), `grab_mode = CAMERA_GRAB_LATEST`, `xclk 20MHz`, flash LED off.
+- Sensor config (firmware ships these): `FRAMESIZE_UXGA` (1600×1200 — raised from the
+  SVGA "to start" baseline for face pixels at room distance; the box crops faces from
+  the full-res frame so resolution → ID accuracy), `jpeg_quality 12`, `fb_count = 2`
+  (PSRAM), `grab_mode = CAMERA_GRAB_LATEST`, `xclk 20MHz`, flash LED off. All
+  runtime-tunable via `/control` — dial framesize down per zone if bandwidth/GPU bound.
 
 ## 3. Registration — declare to the hub (§3.3) — **already accepted box-side**
 `POST /device-declare` (`name:"camera"`) like the rest of the fleet, with the stream
@@ -42,7 +48,7 @@ block. The hub stores it verbatim and the roster surfaces it (`/get-devices`):
 { "name": "camera", "id": "<stable-device-id>", "ip": "<cam-ip>", "zone": "living-room",
   "fw_version": "<FW_VERSION>",
   "stream": { "proto": "mjpeg-http", "port": 81, "path": "/stream",
-              "snapshot": "/capture", "res": "SVGA", "fps": 10 } }
+              "snapshot": "/capture", "res": "UXGA", "fps": 8 } }
 ```
 
 - The hub validates + stores this (`captureStreamDeclare`): a stream needs at least
