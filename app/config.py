@@ -79,6 +79,18 @@ class Config:
     person_conf: float = field(default_factory=lambda: _f("VISION_PERSON_CONF", 0.4))
     face_match_threshold: float = field(default_factory=lambda: _f("VISION_FACE_THRESHOLD", 0.35))
 
+    # Online reinforcement (§4.3): on a confident, UNAMBIGUOUS household match, fold the
+    # live embedding into that member's centroid so passive recognition self-improves
+    # day-to-day (no manual re-enroll). Gated strictly to prevent drift: the match must
+    # clear `reinforce_threshold` (deliberately > the match threshold) AND beat the
+    # 2nd-best member by `reinforce_margin` (so a look-alike can't pull a centroid), and
+    # the running-mean weight is capped at `reinforce_cap` so no single frame dominates
+    # (it becomes a gentle EMA once a member is well-established).
+    face_reinforce: bool = field(default_factory=lambda: _b("VISION_FACE_REINFORCE", True))
+    face_reinforce_threshold: float = field(default_factory=lambda: _f("VISION_FACE_REINFORCE_THRESHOLD", 0.5))
+    face_reinforce_margin: float = field(default_factory=lambda: _f("VISION_FACE_REINFORCE_MARGIN", 0.08))
+    face_reinforce_cap: int = field(default_factory=lambda: _i("VISION_FACE_REINFORCE_CAP", 50))
+
     # ── occupancy debounce (§4.3 / §8 — fire once per arrival, not per frame) ─
     enter_frames: int = field(default_factory=lambda: _i("VISION_ENTER_FRAMES", 3))   # consecutive hits → present
     leave_grace_s: float = field(default_factory=lambda: _f("VISION_LEAVE_GRACE_S", 6.0))  # gone this long → left

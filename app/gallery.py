@@ -154,17 +154,54 @@ class Gallery:
         finally:
             conn.close()
 
-    def _best_household(self, emb: List[float]) -> Tuple[Optional[str], Optional[str], float]:
+    def _best_household(self, emb: List[float]) -> Tuple[Optional[str], Optional[str], float, float]:
+        """Best household match for an embedding. Returns
+        (user_id, name, best_score, margin) where `margin` is best_score minus the
+        2nd-best member's score — a measure of how UNAMBIGUOUS the match is (large when
+        one member clearly wins; small when two members score alike). margin is +inf when
+        there's only one enrolled member (nothing to confuse it with)."""
         conn = self._db()
         try:
-            best = (None, None, -1.0)
+            scored = []
             for uid, name, blob in conn.execute("SELECT user_id, name, embedding FROM faces"):
-                s = _cosine(emb, json.loads(blob))
-                if s > best[2]:
-                    best = (uid, name, s)
-            return best
+                scored.append((_cosine(emb, json.loads(blob)), uid, name))
+            if not scored:
+                return (None, None, -1.0, 0.0)
+            scored.sort(key=lambda t: t[0], reverse=True)
+            best_s, best_uid, best_name = scored[0]
+            margin = best_s - scored[1][0] if len(scored) > 1 else float("inf")
+            return (best_uid, best_name, best_s, margin)
         finally:
             conn.close()
+
+    def _reinforce_household(self, user_id: str, emb: List[float]) -> None:
+        """Online learning: fold a confidently+unambiguously matched LIVE embedding into
+        the member's centroid via running-mean, so passive day-to-day recognition keeps
+        getting sharper without a manual re-enroll. The caller gates this on score/margin
+        (see resolve); here we only bound the influence:
+          * the running-mean weight is capped at `face_reinforce_cap`, so once a member is
+            well-established each new frame nudges the centroid by ≤ 1/(cap+1) (a gentle
+            EMA) — one bad crop can't yank the identity.
+          * `samples` stops incrementing at the cap (purely cosmetic; the centroid keeps
+            adapting). name + thumb are never touched (we keep the deliberate enroll face)."""
+        emb = _normalise(emb)
+        cap = max(1, cfg.face_reinforce_cap)
+        with _lock:
+            conn = self._db()
+            try:
+                row = conn.execute("SELECT embedding, samples FROM faces WHERE user_id=?", (user_id,)).fetchone()
+                if not row:
+                    return
+                cur = int(row[1])
+                merged = _running_mean(json.loads(row[0]), min(cur, cap), emb)
+                samples = cur + 1 if cur < cap else cur
+                conn.execute(
+                    "UPDATE faces SET embedding=?, samples=?, updated_at=datetime('now') WHERE user_id=?",
+                    (json.dumps(merged), samples, user_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
     # ── guest clustering (§4.3 / §11.7) ───────────────────────────────────────
     def _cluster_guest(self, emb: List[float], thumb: Optional[bytes] = None) -> Tuple[str, Optional[str], int]:
@@ -318,8 +355,12 @@ class Gallery:
         person therefore gets a stable default id (`guest:N`); `thumb` (the captured
         face crop) is stored so the dashboard can show their face. This is the one call
         the camera worker makes once per new/unmatched track (§4.1)."""
-        uid, name, score = self._best_household(emb)
+        uid, name, score, margin = self._best_household(emb)
         if uid is not None and score >= cfg.face_match_threshold:
+            # Self-improve on a confident + unambiguous match (gated to prevent drift).
+            if (cfg.face_reinforce and score >= cfg.face_reinforce_threshold
+                    and margin >= cfg.face_reinforce_margin):
+                self._reinforce_household(uid, emb)
             return Identity(id=uid, name=name, cls="household",
                             confidence=_confidence(score, cfg.face_match_threshold))
         gid, gname, sightings = self._cluster_guest(emb, thumb)

@@ -93,3 +93,42 @@ def test_promoted_guest_drops_from_people_and_carries_face():
     ids = {p["id"] for p in g.people()}
     assert "guest:1" not in ids and "u9" in ids       # promoted guest no longer a guest row
     assert g.get_thumb("u9") == b"GUESTFACE"           # face carried into the member profile
+
+
+def test_online_reinforcement_strengthens_household_on_confident_match():
+    cfg.face_match_threshold = 0.3
+    cfg.face_reinforce = True
+    cfg.face_reinforce_threshold = 0.5
+    cfg.face_reinforce_margin = 0.05
+    cfg.face_reinforce_cap = 50
+    g = _g()
+    g.enroll("u1", "David", _vec(1.0))            # samples = 1
+    assert g.profiles()[0]["samples"] == 1
+    ident = g.resolve(_vec(1.0))                  # confident match, sole member (margin=inf)
+    assert ident.cls == "household" and ident.id == "u1"
+    assert g.profiles()[0]["samples"] == 2        # ← passive recognition reinforced the centroid
+    g.resolve(_vec(1.0))
+    assert g.profiles()[0]["samples"] == 3        # keeps self-improving on each confident sighting
+
+
+def test_reinforcement_skips_ambiguous_match_and_respects_toggle():
+    cfg.face_match_threshold = 0.3
+    cfg.face_reinforce = True
+    cfg.face_reinforce_threshold = 0.5
+    cfg.face_reinforce_margin = 0.05
+    cfg.face_reinforce_cap = 50
+    g = _g()
+    # Two members with identical embeddings → a tie (margin 0): a look-alike. Reinforcement
+    # must NOT fire — drifting one centroid on a 50/50 call is exactly the failure to avoid.
+    g.enroll("u1", "Ann", _vec(1.0))
+    g.enroll("u2", "Bea", _vec(1.0))
+    g.resolve(_vec(1.0))
+    assert all(p["samples"] == 1 for p in g.profiles())   # neither reinforced
+
+    # Kill-switch: disabled → never reinforce, even on a clean sole-member match.
+    cfg.face_reinforce = False
+    g2 = _g()
+    g2.enroll("u1", "David", _vec(1.0))
+    g2.resolve(_vec(1.0))
+    assert g2.profiles()[0]["samples"] == 1
+    cfg.face_reinforce = True   # restore default for any later tests
