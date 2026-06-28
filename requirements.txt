@@ -18,8 +18,12 @@ paho-mqtt>=1.6              # ingestion producer (homehub/<zone>/<cam>/<channel>
 # numpy>=1.26
 
 # ── real perception backend (§4.2 / §11.1 / §11.2 — the GPU/ROCm DECISION) ──
-# Person detect + track (VISION_BACKEND=ultralytics):
-#   .venv/bin/pip install ultralytics
+# Person detect + track (VISION_BACKEND=ultralytics) — CPU stack (2026-06-28, M1 live):
+#   .venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+#   .venv/bin/pip install ultralytics lap opencv-python numpy
+#   NB: `lap` (ByteTrack linear-assignment) is REQUIRED for .track(). Without it ultralytics
+#   tries to pip-install it at runtime on the first frame, which BLOCKS the worker and
+#   ByteTrack errors ("object of type 'int' has no len()") until present — install it up front.
 # Face detect + embed (VISION_FACE_BACKEND=insightface):
 #   .venv/bin/pip install insightface onnxruntime           # CPU face stack (viable fallback, §11.2)
 # ROCm runtime DECISION (§11.2): for GPU person-detect use a torch-ROCm wheel

@@ -42,7 +42,10 @@ class CameraWorker(threading.Thread):
         self.connected: bool = False
 
         # per-track resolved identity cache (embed once per person, §4.1).
-        self._ident: Dict[str, Identity] = {}
+        # NB: must NOT be named `_ident` — this class subclasses threading.Thread, which
+        # uses `self._ident` for the thread id and overwrites it on .start() (an int),
+        # breaking len() in _prune_idents. Use `_idents`.
+        self._idents: Dict[str, Identity] = {}
         self._last_pipeline = 0.0
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
@@ -55,7 +58,9 @@ class CameraWorker(threading.Thread):
                 backoff = 1.0
             except Exception as e:  # noqa: BLE001 — reconnect, never die
                 self.connected = False
-                print(f"[vision] cam {self.cam.id} stream error: {e}; retry in {backoff:.0f}s", flush=True)
+                # repr (not str) so a code bug (e.g. TypeError) is distinguishable from a
+                # transient network error at a glance — the difference matters for triage.
+                print(f"[vision] cam {self.cam.id} stream error: {e!r}; retry in {backoff:.0f}s", flush=True)
                 if self._stop.wait(backoff):
                     break
                 backoff = min(30.0, backoff * 2)
@@ -106,7 +111,7 @@ class CameraWorker(threading.Thread):
         labels: Dict[str, str] = {}
         observations: List[Observation] = []
         for t in tracks:
-            ident = self._ident.get(t.track_id)
+            ident = self._idents.get(t.track_id)
             # Embed + resolve once per track, then re-try only while still unknown.
             if ident is None or ident.cls == "unknown":
                 emb = self.face.embed(frame, t.bbox)
@@ -116,7 +121,7 @@ class CameraWorker(threading.Thread):
                     ident = gallery.resolve(emb, crop_jpeg(frame, t.bbox))
                 else:
                     ident = ident or UNKNOWN
-                self._ident[t.track_id] = ident
+                self._idents[t.track_id] = ident
             observations.append(Observation(track_id=t.track_id, identity=ident))
             # Live overlay label: real name if known, else the default "Person N" for a
             # guest cluster (every detected person is labelled by default), else "person".
@@ -143,8 +148,8 @@ class CameraWorker(threading.Thread):
         self._prune_idents({t.track_id for t in tracks})
 
     def _prune_idents(self, live: set) -> None:
-        if len(self._ident) > 256:
-            self._ident = {k: v for k, v in self._ident.items() if k in live}
+        if len(self._idents) > 256:
+            self._idents = {k: v for k, v in self._idents.items() if k in live}
 
     # ── dashboard re-serve (§3.2 — we are the ONLY client of the cam) ─────────
     def mjpeg_generator(self, annotated: bool = True):
