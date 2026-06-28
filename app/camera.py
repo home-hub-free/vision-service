@@ -1,8 +1,22 @@
-"""CameraWorker — the per-camera pipeline (§4.1/§4.2), one daemon thread per stream.
+"""CameraWorker — the per-camera pipeline (§4.1/§4.2).
 
     pull MJPEG → (capped FPS) decode → person-detect+track → (on new/unmatched track)
     face-detect+embed → gallery.resolve → occupancy.update → publish edges + index
     + drive recorder.
+
+TWO THREADS, decoupled (this matters — see below):
+  * READER (`run`): drains the camera's MJPEG stream CONTINUOUSLY, full-rate, doing only
+    cheap work (relay slot, frames_seen, recorder feed). It hands the freshest frame to
+    the processor and immediately reads the next.
+  * PROCESSOR (`_process_loop`): runs the heavy perception pipeline on the LATEST frame,
+    paced at `detect_fps`, dropping stale frames.
+
+Why split them: the ESP32-CAM's MJPEG server is single-consumer and needs a consumer
+that drains continuously. If the reader pauses to run inference (YOLO + SCRFD/ArcFace,
+hundreds of ms), the camera's send blocks, the sensor pipeline stalls, the read times
+out (>10s), and the worker drops into a multi-second reconnect backoff — which
+collapsed the effective frame rate to ~0.25 fps and broke ByteTrack continuity /
+occupancy. Keeping the reader free of inference keeps the camera streaming.
 
 Two FPS budgets keep the GPU honest (§11.1): every frame is relayed for the live view
 (cheap), but the perception pipeline runs at `detect_fps`, and face-embed is gated on
@@ -32,7 +46,10 @@ class CameraWorker(threading.Thread):
         self.detector = make_detector()
         self.face = make_face_engine()
         self.recorder = Recorder(cam.id, cam.zone, index)
-        self._stop = threading.Event()
+        # NB: not `_stop` — threading.Thread._stop is an internal METHOD it calls when a
+        # thread finishes/joins; shadowing it with an Event breaks join() ("'Event' object
+        # is not callable"). Same trap as _ident/_idents above.
+        self._stop_evt = threading.Event()
 
         # latest frames for the dashboard re-serve.
         self.latest_raw: Optional[bytes] = None
@@ -41,18 +58,29 @@ class CameraWorker(threading.Thread):
         self.frames_seen: int = 0
         self.connected: bool = False
 
-        # per-track resolved identity cache (embed once per person, §4.1).
-        # NB: must NOT be named `_ident` — this class subclasses threading.Thread, which
-        # uses `self._ident` for the thread id and overwrites it on .start() (an int),
-        # breaking len() in _prune_idents. Use `_idents`.
+        # Reader→processor handoff: a single latest-frame slot (we always process the
+        # freshest, never a backlog). The reader fills it; the processor drains it.
+        self._frame_cv = threading.Condition()
+        self._pending_frame: Optional[bytes] = None
+        self._proc_thread: Optional[threading.Thread] = None
+        self._present = False  # set by the processor, read by the reader to gate recording
+
+        # per-track resolved identity cache (embed once per person, §4.1). Touched ONLY
+        # by the processor thread. NB: must NOT be named `_ident` — this class subclasses
+        # threading.Thread, which uses `self._ident` for the thread id and overwrites it
+        # on .start() (an int), breaking len() in _prune_idents. Use `_idents`.
         self._idents: Dict[str, Identity] = {}
         self._last_pipeline = 0.0
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
     def run(self) -> None:
+        """READER thread: drain the camera continuously; never run inference here."""
         self.recorder.start()
+        self._proc_thread = threading.Thread(
+            target=self._process_loop, name=f"vision-proc-{self.cam.id}", daemon=True)
+        self._proc_thread.start()
         backoff = 1.0
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             try:
                 self._pump()
                 backoff = 1.0
@@ -61,13 +89,22 @@ class CameraWorker(threading.Thread):
                 # repr (not str) so a code bug (e.g. TypeError) is distinguishable from a
                 # transient network error at a glance — the difference matters for triage.
                 print(f"[vision] cam {self.cam.id} stream error: {e!r}; retry in {backoff:.0f}s", flush=True)
-                if self._stop.wait(backoff):
+                if self._stop_evt.wait(backoff):
                     break
-                backoff = min(30.0, backoff * 2)
+                # Cap low: a transient stall shouldn't blacken the feed for 30s. With the
+                # reader decoupled, stalls should be rare anyway.
+                backoff = min(5.0, backoff * 2)
+        # Wake + join the processor so we shut down cleanly.
+        with self._frame_cv:
+            self._frame_cv.notify_all()
+        if self._proc_thread is not None:
+            self._proc_thread.join(timeout=2.0)
         self.recorder.stop()
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_evt.set()
+        with self._frame_cv:  # unblock the processor's wait()
+            self._frame_cv.notify_all()
 
     def _pump(self) -> None:
         url = self.cam.stream_url
@@ -78,7 +115,7 @@ class CameraWorker(threading.Thread):
         print(f"[vision] cam {self.cam.id} streaming from {url}", flush=True)
         try:
             for jpeg in iter_jpeg_frames(resp.read):
-                if self._stop.is_set():
+                if self._stop_evt.is_set():
                     break
                 self._on_frame(jpeg)
         finally:
@@ -88,20 +125,50 @@ class CameraWorker(threading.Thread):
                 pass
             self.connected = False
 
-    # ── per-frame ─────────────────────────────────────────────────────────────
+    # ── reader: per-frame, CHEAP only (no inference — see module docstring) ─────
     def _on_frame(self, jpeg: bytes) -> None:
         now = time.time()
-        self.latest_raw = jpeg
+        self.latest_raw = jpeg          # full-rate relay slot for the dashboard
         self.last_frame_ts = now
         self.frames_seen += 1
+        # Recording is driven from the reader so it sees every frame at full rate; the
+        # presence gate (`_present`) is computed by the processor. write_frame just feeds
+        # an already-running ffmpeg (or the pre-roll ring) and never blocks meaningfully.
         self.recorder.write_frame(jpeg)
+        self.recorder.on_presence(self._present)
         self.recorder.tick()
+        # Hand the freshest frame to the processor, overwriting any unprocessed one — we
+        # never want a backlog; perception always works on the latest frame.
+        with self._frame_cv:
+            self._pending_frame = jpeg
+            self._frame_cv.notify()
 
-        # Throttle the heavy pipeline to detect_fps (relay stays full-rate).
-        if cfg.detect_fps <= 0 or (now - self._last_pipeline) < (1.0 / cfg.detect_fps):
-            return
-        self._last_pipeline = now
-        self._run_pipeline(jpeg, now)
+    # ── processor: the heavy pipeline on its OWN thread, paced at detect_fps ─────
+    def _process_loop(self) -> None:
+        while not self._stop_evt.is_set():
+            with self._frame_cv:
+                while self._pending_frame is None and not self._stop_evt.is_set():
+                    self._frame_cv.wait(timeout=1.0)
+                jpeg = self._pending_frame
+                self._pending_frame = None
+            if jpeg is None or self._stop_evt.is_set():
+                continue
+            # Pace the heavy pipeline at detect_fps (the reader/relay stays full-rate).
+            now = time.time()
+            if cfg.detect_fps > 0:
+                wait = (1.0 / cfg.detect_fps) - (now - self._last_pipeline)
+                if wait > 0 and self._stop_evt.wait(wait):
+                    break
+                with self._frame_cv:  # grab a fresher frame if one arrived while pacing
+                    if self._pending_frame is not None:
+                        jpeg = self._pending_frame
+                        self._pending_frame = None
+                now = time.time()
+            self._last_pipeline = now
+            try:
+                self._run_pipeline(jpeg, now)
+            except Exception as e:  # noqa: BLE001 — a bad frame must never kill perception
+                print(f"[vision] cam {self.cam.id} pipeline error: {e!r}", flush=True)
 
     def _run_pipeline(self, jpeg: bytes, now: float) -> None:
         frame = decode_jpeg(jpeg)
@@ -134,7 +201,7 @@ class CameraWorker(threading.Thread):
 
         edges = tracker.update(self.cam.id, self.cam.zone, observations, now)
         count = len(tracker.snapshot(self.cam.zone).get(self.cam.zone, []))
-        self.recorder.on_presence(count > 0)
+        self._present = count > 0  # reader reads this to drive gated recording
         for edge in edges:
             ingest.publish_edge(edge, count)
             index.record_event(edge)
@@ -156,7 +223,7 @@ class CameraWorker(threading.Thread):
         """Yield multipart MJPEG of the latest frame (annotated when available). The
         dashboard views THIS, never the camera directly (a 2nd client stalls the cam)."""
         last_sent = 0.0
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             frame = (self.latest_annotated if annotated else None) or self.latest_raw
             if frame is not None and self.last_frame_ts != last_sent:
                 last_sent = self.last_frame_ts
