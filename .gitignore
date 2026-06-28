@@ -1,0 +1,8 @@
+# vision-service local artifacts — never tracked.
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+.env
+# runtime data: gallery/index sqlite + recordings + HLS (biometrics + bulky video).
+data/

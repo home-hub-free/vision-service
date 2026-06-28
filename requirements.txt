@@ -1,0 +1,28 @@
+# vision-service dependencies.
+#
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements.txt
+#
+# The default VISION_BACKEND=null / VISION_FACE_BACKEND=null build needs only the web
+# + MQTT deps below (no torch, no ROCm) and is enough to run M0 (solid stream + view +
+# recording + retention) and to build/test all the plumbing + dashboard UI — same
+# posture as the speaker-service `stub` backend.
+
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9     # multipart image upload (Face-ID enroll)
+paho-mqtt>=1.6              # ingestion producer (homehub/<zone>/<cam>/<channel>)
+
+# ── frame decode + annotation (needed once a real perception backend is on) ──
+# opencv-python-headless>=4.9   # decode JPEG + draw boxes/names for the annotated view
+# numpy>=1.26
+
+# ── real perception backend (§4.2 / §11.1 / §11.2 — the GPU/ROCm DECISION) ──
+# Person detect + track (VISION_BACKEND=ultralytics):
+#   .venv/bin/pip install ultralytics
+# Face detect + embed (VISION_FACE_BACKEND=insightface):
+#   .venv/bin/pip install insightface onnxruntime           # CPU face stack (viable fallback, §11.2)
+# ROCm runtime DECISION (§11.2): for GPU person-detect use a torch-ROCm wheel
+#   (pip install --index-url https://download.pytorch.org/whl/rocm6.2 torch torchvision)
+#   OR export models to ONNX and install onnxruntime-rocm. Face stages are small and
+#   run fine on CPU — spike the GPU path before committing (mirror the TTS ROCm friction).

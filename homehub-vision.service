@@ -1,0 +1,36 @@
+# systemd unit for the vision-service (camera perception → occupancy/identity).
+#   cd /opt/home-hub-free/vision-service
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#   sudo cp homehub-vision.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now homehub-vision
+#
+# Ships runnable with VISION_BACKEND=null (no GPU): M0 stream + view + recording.
+# For real identity set VISION_BACKEND=ultralytics / VISION_FACE_BACKEND=insightface
+# in .env and install the extras (requirements.txt). The GPU (R9700) is shared with
+# llama-server (:8083) + Fish TTS (:8100) — uncomment HIP_VISIBLE_DEVICES + the
+# render/video groups ONLY when running a GPU backend, and watch voice TTFA (§11.1).
+[Unit]
+Description=home-hub vision-service (camera perception, occupancy + identity)
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as 'david' to match the other Python ML services (venv + HF model cache).
+User=david
+Group=david
+# render+video are needed for HIP/ROCm if a GPU perception backend is enabled.
+# SupplementaryGroups=render video
+WorkingDirectory=/opt/home-hub-free/vision-service
+EnvironmentFile=-/opt/home-hub-free/vision-service/.env
+Environment=VISION_PORT=8130
+# GPU backend only (leave commented for the null/CPU build):
+# Environment=HIP_VISIBLE_DEVICES=0
+# Environment=VISION_DEVICE=cuda
+# Environment=VISION_ORT_PROVIDERS=ROCMExecutionProvider,CPUExecutionProvider
+ExecStart=/opt/home-hub-free/vision-service/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8130
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
