@@ -30,7 +30,7 @@ import threading
 import time
 from typing import Dict, List, Optional
 
-from . import ingest
+from . import hub_push, ingest
 from .config import cfg
 from .hub_client import Camera
 from .mjpeg import iter_jpeg_frames, multipart_chunk, open_stream
@@ -217,11 +217,17 @@ class CameraWorker(threading.Thread):
                 labels[t.track_id] = "person"
 
         edges = tracker.update(self.cam.id, self.cam.zone, observations, now)
-        count = len(tracker.snapshot(self.cam.zone).get(self.cam.zone, []))
+        zone_people = tracker.snapshot(self.cam.zone).get(self.cam.zone, [])
+        count = len(zone_people)
         self._present = count > 0  # reader reads this to drive gated recording
         for edge in edges:
             ingest.publish_edge(edge, count)
             index.record_event(edge)
+        # On any salient change, push the per-zone occupancy+identity digest to the hub so it
+        # FUSES it into the `rooms` world-model the agent reads (§3.1). Edges already debounce —
+        # so this fires once per arrival/leave, not per frame. Best-effort; never throws.
+        if edges:
+            hub_push.push_room(self.cam.zone, zone_people)
 
         # Annotated frame for the dashboard's "who is here" view (§6).
         if tracks:

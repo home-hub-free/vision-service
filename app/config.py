@@ -78,6 +78,15 @@ class Config:
     ingestion_enabled: bool = field(default_factory=lambda: _b("VISION_INGESTION_ENABLED", True))
     mqtt_url: str = field(default_factory=lambda: os.getenv("MQTT_URL", "mqtt://127.0.0.1:1883"))
 
+    # ── hub room-digest push (PERCEPTION_TO_AGENT_PLAN §3.1 — the agent-facing fusion) ─
+    # Besides the MQTT producer (above, which feeds memory + the agent WAKE lane), we PUSH a
+    # small per-zone occupancy+identity digest straight to the hub on every salient change, so
+    # the hub can FUSE it (with ambient mic + PIR) into the `rooms` world-model the agent reads
+    # on GET /state. Best-effort like ingestion: POST /perception, fire-and-forget, never throws
+    # into perception, a no-op when the hub is down. Only resolved {id,name,class,confidence}
+    # crosses — NEVER an embedding (biometrics stay on the box). Default ON; flip off to isolate.
+    hub_push_enabled: bool = field(default_factory=lambda: _b("VISION_HUB_PUSH_ENABLED", True))
+
     # ── perception backends (§4.2, §11.1/§11.2 — the GPU/ROCm decisions) ─────
     # person/track: "null" (no detection — M0) | "ultralytics" (YOLO+ByteTrack).
     # face: "null" (no ID) | "insightface" (SCRFD detect + ArcFace embed).
