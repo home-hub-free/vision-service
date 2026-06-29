@@ -39,15 +39,18 @@ def _svc_headers() -> dict:
 class Camera:
     """A camera as the roster sees it, with the stream URL already built.
 
-    `stream_url_override` / `snapshot_url_override` let a non-declaring source
-    (the §2 VISION_STATIC_CAMERAS escape hatch) carry a pre-built, any-scheme URL
-    (http MJPEG or rtsp://) that bypasses the ip+port+path builder."""
+    `stream_url_override` / `snapshot_url_override` / `record_url_override` let a
+    non-declaring source (the §2 VISION_STATIC_CAMERAS escape hatch) carry pre-built URLs
+    verbatim, bypassing the ip+port+path builder. The reader auto-selects transport by
+    scheme: `http(s)://` → MJPEG (`mjpeg.open_stream`), `rtsp://` → H.264
+    (`rtsp.iter_rtsp_frames`)."""
 
     def __init__(
         self,
         raw: dict,
         stream_url_override: Optional[str] = None,
         snapshot_url_override: Optional[str] = None,
+        record_url_override: Optional[str] = None,
     ) -> None:
         self.id = str(raw.get("id"))
         self.name = raw.get("name")
@@ -57,6 +60,7 @@ class Camera:
         self.fw_version = raw.get("fwVersion")
         self._stream_url_override = stream_url_override
         self._snapshot_url_override = snapshot_url_override
+        self._record_url_override = record_url_override
 
     @property
     def stream_url(self) -> Optional[str]:
@@ -77,17 +81,30 @@ class Camera:
         port = self.stream.get("port", 81)
         return f"http://{self.ip}:{port}{snap}"
 
+    @property
+    def record_url(self) -> Optional[str]:
+        """Optional full-quality MAIN stream recorded by codec-copy (recorder.py) while
+        the reader/detector runs on `stream_url` (the cheap substream) — the dual-stream
+        split (DECISIONS #1). Set verbatim via the static-spec 2nd URL or a `recordUrl`
+        in the declared `stream` block. None → record the reader's own stream the classic
+        JPEG-pipe way (and gated/pre-roll stays available)."""
+        return self._record_url_override or self.stream.get("recordUrl")
+
     def __repr__(self) -> str:
         return f"<Camera {self.id} zone={self.zone} {self.stream_url}>"
 
 
 def parse_static_cameras(spec: str) -> List[Camera]:
-    """Parse VISION_STATIC_CAMERAS into Cameras with a pre-built stream URL.
+    """Parse VISION_STATIC_CAMERAS into Cameras with pre-built stream URL(s).
 
-    Format: a comma-list of `id@zone@url` (CAMERA_BRINGUP_PLAN §2). The URL is taken
-    verbatim (split capped at 3 fields, so credentials/paths containing '@' survive),
-    so any MJPEG-http or rtsp:// source works. Malformed entries are skipped with a
-    log — never raise into the supervisor's hot poll path."""
+    Format: a comma-list of `id@zone@url` (CAMERA_BRINGUP_PLAN §2), where `url` may be a
+    single stream OR `<detect-url> <record-url>` (space-separated) for the dual-stream
+    split — the first URL is the reader/detect stream (point at the SUBSTREAM), the second
+    is the full-quality MAIN stream recorded by codec-copy. The `@` split caps at 3 fields
+    so `rtsp://user:pass@host` credentials survive; URLs are split on whitespace (URLs
+    contain none). The reader auto-selects HTTP-MJPEG vs RTSP by scheme (`rtsp.is_rtsp`).
+    Malformed entries are skipped with a log — never raise into the supervisor's hot poll
+    path."""
     cams: List[Camera] = []
     for entry in spec.split(","):
         entry = entry.strip()
@@ -96,12 +113,15 @@ def parse_static_cameras(spec: str) -> List[Camera]:
         parts = entry.split("@", 2)
         if len(parts) < 3 or not parts[0].strip() or not parts[2].strip():
             print(f"[vision] ignoring malformed VISION_STATIC_CAMERAS entry {entry!r} "
-                  "(want id@zone@url)", flush=True)
+                  "(want id@zone@url[ record-url])", flush=True)
             continue
-        cam_id, zone, url = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        cam_id, zone = parts[0].strip(), parts[1].strip()
+        urls = parts[2].split()
+        stream_url = urls[0]
+        record_url = urls[1] if len(urls) > 1 else None
         raw = {"id": cam_id, "name": "camera", "zone": zone or "_",
-               "ip": urlparse(url).hostname}
-        cams.append(Camera(raw, stream_url_override=url))
+               "ip": urlparse(stream_url).hostname}
+        cams.append(Camera(raw, stream_url_override=stream_url, record_url_override=record_url))
     return cams
 
 
@@ -114,7 +134,7 @@ def fetch_cameras() -> List[Camera]:
     except (urllib.error.URLError, OSError, ValueError) as e:
         # A hub outage must not disable the §2 escape hatch — fall through to static.
         print(f"[vision] roster fetch failed: {e}", flush=True)
-    # §2 escape hatch: augment the roster with non-declaring sources (IP/RTSP/webcam)
+    # §2 escape hatch: augment the roster with non-declaring sources (MJPEG-HTTP IP cam/webcam)
     # for the image-quality go/no-go before firmware exists. Roster wins on id clash.
     have = {c.id for c in cams}
     for sc in parse_static_cameras(cfg.static_cameras):

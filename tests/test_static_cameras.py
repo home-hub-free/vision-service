@@ -1,8 +1,10 @@
 """VISION_STATIC_CAMERAS escape hatch (CAMERA_BRINGUP_PLAN §2) — pure parsing, no net.
 
-The §2 go/no-go validates the whole box pipeline against any MJPEG/RTSP source BEFORE
-the ESP32-CAM firmware declares. These tests pin the `id@zone@url` parsing + the
-roster-augment behaviour so the hatch can't silently break.
+The §2 go/no-go validates the whole box pipeline against any MJPEG-over-HTTP source
+BEFORE the ESP32-CAM firmware declares. These tests pin the `id@zone@url` parsing + the
+roster-augment behaviour so the hatch can't silently break. The parser is deliberately
+scheme-agnostic (it preserves an `rtsp://` URL verbatim, forward-compat for a future
+RTSP reader), even though the frame reader pulls HTTP MJPEG only today (see app/mjpeg.py).
 """
 from app.hub_client import Camera, fetch_cameras, parse_static_cameras
 
@@ -52,6 +54,27 @@ def test_override_takes_precedence_over_builder():
     c = Camera({"id": "x", "ip": "1.2.3.4", "stream": {"path": "/stream", "port": 81}},
                stream_url_override="rtsp://1.2.3.4/live")
     assert c.stream_url == "rtsp://1.2.3.4/live"
+
+
+def test_dual_stream_two_urls():
+    # "<detect-substream> <record-mainstream>": reader/detect on the first, record the 2nd.
+    cams = parse_static_cameras(
+        "patio@garden@rtsp://u:p@h:554/stream2 rtsp://u:p@h:554/stream1")
+    assert len(cams) == 1
+    c = cams[0]
+    assert c.stream_url == "rtsp://u:p@h:554/stream2"
+    assert c.record_url == "rtsp://u:p@h:554/stream1"
+    assert c.zone == "garden"
+
+
+def test_single_url_has_no_record_url():
+    cams = parse_static_cameras("lab@sala@http://192.168.1.50:81/stream")
+    assert cams[0].record_url is None
+
+
+def test_record_url_from_override_and_stream_block():
+    assert Camera({"id": "x"}, record_url_override="rtsp://h/main").record_url == "rtsp://h/main"
+    assert Camera({"id": "y", "stream": {"recordUrl": "rtsp://h/decl"}}).record_url == "rtsp://h/decl"
 
 
 def test_fetch_cameras_augments_with_static_when_hub_down(monkeypatch):

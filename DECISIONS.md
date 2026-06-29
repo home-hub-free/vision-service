@@ -10,7 +10,7 @@ re-architecture.
 |---|---|---|---|---|
 | 1 | **GPU contention** — vision vs voice TTFA (§11.1) | `VISION_DETECT_FPS=5`, face-embed gated on new tracks, null backend | `app/camera.py` throttle + `app/config.py` `detect_fps` | Measure voice TTFA with a real backend on; set the FPS cap / decide time-slice. Pick a target "vision must not regress TTFA beyond X". |
 | 2 | **ROCm runtime** — torch-ROCm vs onnxruntime-ROCm (§11.2) | CPU/null (`VISION_DEVICE=cpu`) | `app/perception.py` `_UltralyticsDetector.device`, `_InsightFaceEngine` providers; `requirements.txt` | Spike both; set `VISION_DEVICE=cuda` and/or `VISION_ORT_PROVIDERS=ROCMExecutionProvider`. Face stages run fine on CPU as a fallback. |
-| 3 | **ESP32-CAM image quality for ID** — M2 go/no-go (§11.3) | **escape hatch shipped, verdict OPEN** (presence works regardless) | `VISION_STATIC_CAMERAS` env (`hub_client.parse_static_cameras`) — pull any MJPEG/RTSP source with NO firmware; `Camera.stream_url` is camera-agnostic | **[HUMAN/HW]** Run the §2 spike (see README "Validation spike") against a known-good cam, stand at room distance, record GO/NO-GO below. If OV2640 ID is poor → point the roster (or a static entry) at an **RTSP/IP cam** (1080p) — only the URL changes; pipeline is identical. |
+| 3 | **ESP32-CAM image quality for ID** — M2 go/no-go (§11.3) | **escape hatch shipped, verdict OPEN** (presence works regardless) | `VISION_STATIC_CAMERAS` env (`hub_client.parse_static_cameras`) — pull any MJPEG-HTTP **or RTSP** source with NO firmware (reader auto-selects by scheme, `app/rtsp.py`); dual-stream via a 2nd record URL | **[HUMAN/HW]** Run the §2 spike (see README "Validation spike") against a known-good cam, stand at room distance, record GO/NO-GO below. If OV2640 ID is poor → point the roster (or a static entry) at a higher-res IP cam (1080p): both **MJPEG-HTTP** and **RTSP/H.264** are config-only now (RTSP wired in `app/rtsp.py`); use the dual-stream form for ID rooms (detect on substream, record main by codec-copy). |
 | 4 | **Recording encode** — CPU libx264 vs GPU VAAPI/AMF (§9.1/§11.4) | `VISION_REC_ENCODER=libx264` | `app/recorder.py` `_encode_args` | Measure CPU under load; set `VISION_REC_ENCODER=vaapi` (or `amf`) if it saturates AND doesn't starve the vision/LLM GPU. |
 | 5 | **Retention numbers / disk cap** (§9.3/§11.4) | `VISION_RETENTION_DAYS=14`, `VISION_DISK_CAP_GB=0` (age-only) | `app/config.py` + `app/retention.py` | Measure one real day/camera; set days + cap from the measured GB. |
 | 6 | **At-rest encryption** of recordings (§9.3/§11.4) | off (playback gated behind dashboard auth) | `app/recorder.py` output path | Decide if raw video at rest needs encryption; if so, encrypt the `recordings/` volume. |
@@ -36,8 +36,9 @@ discovery; brownout detector disabled. `pio run` → `firmware.bin` (RAM 16%, Fl
 
 ## Resolved decision verdicts (record as you run the spikes)
 - **#3 ESP32-CAM image quality — GO / NO-GO:** _OPEN_ — run the §2 validation spike
-  (README) and record here: ⬜ GO (OV2640 adequate at room distance) · ⬜ NO-GO (use
-  RTSP/IP cam for ID rooms, ESP32-CAM presence-only).
+  (README) and record here: ⬜ GO (OV2640 adequate at room distance) · ⬜ NO-GO (use a
+  higher-res IP cam for ID rooms — MJPEG-HTTP or RTSP, both supported — ESP32-CAM
+  presence-only).
 - **#1 GPU contention — voice-TTFA regression target:** _OPEN_ — measure TTFA with a
   real backend on vs idle; record the chosen `VISION_DETECT_FPS` cap + the target
   ("vision must not regress TTFA beyond X ms").

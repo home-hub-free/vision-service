@@ -53,7 +53,7 @@ class Config:
     roster_poll_s: float = field(default_factory=lambda: _f("VISION_ROSTER_POLL_S", 30.0))
 
     # ── §2 validation escape hatch (CAMERA_BRINGUP_PLAN §2, DECISIONS #3 go/no-go) ─
-    # Pull a camera that has NOT declared to the hub — an IP/RTSP cam, a laptop/USB
+    # Pull a camera that has NOT declared to the hub — an MJPEG-HTTP IP cam, a laptop/USB
     # webcam served as MJPEG, or the bare ESP32-CAM before its firmware declares — so
     # the WHOLE box pipeline (detect → track → face → ID) can be validated for the
     # image-quality go/no-go BEFORE any firmware exists. Comma-list of `id@zone@url`
@@ -61,6 +61,16 @@ class Config:
     # default source; these only fill ids the roster doesn't already carry. Empty by
     # default → roster is the only camera source.
     static_cameras: str = field(default_factory=lambda: os.getenv("VISION_STATIC_CAMERAS", ""))
+
+    # ── RTSP transport (rtsp:// cameras — Reolink/Amcrest/Dahua/Tapo/ONVIF) ──────
+    # The reader auto-selects RTSP vs HTTP-MJPEG by URL scheme (`app/rtsp.is_rtsp`). TCP
+    # is the reliable default (UDP corrupts H.264 on busy Wi-Fi); raise the timeout for
+    # flaky links. These apply only to rtsp:// sources. RTSP cameras need opencv installed
+    # (the reader decodes via OpenCV's FFmpeg backend) + ffmpeg on PATH for codec-copy
+    # recording of the main stream — see requirements.txt.
+    rtsp_transport: str = field(default_factory=lambda: os.getenv("VISION_RTSP_TRANSPORT", "tcp"))
+    rtsp_timeout_s: float = field(default_factory=lambda: _f("VISION_RTSP_TIMEOUT_S", 5.0))
+    rtsp_max_read_misses: int = field(default_factory=lambda: _i("VISION_RTSP_MAX_READ_MISSES", 30))
 
     # ── ingestion (this service is its OWN MQTT producer — §5.2) ─────────────
     # Mirrors the hub's seam: publishes to homehub/<zone>/<camId>/<channel>, gated on

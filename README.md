@@ -67,17 +67,29 @@ household member — those write endpoints are bearer-auth gated.
 
 ## Validation spike (§2 image-quality go/no-go) — no firmware required
 
-The service is **camera-agnostic**: it pulls any MJPEG/RTSP URL. So you can validate the
-*whole box pipeline* (detect → track → face → ID) against a known-good camera **before**
-investing in ESP32-CAM firmware — the cheapest de-risk and the answer to DECISIONS #3.
+The service pulls any **MJPEG-over-HTTP** source, so you can validate the *whole box
+pipeline* (detect → track → face → ID) against a known-good camera **before** investing
+in ESP32-CAM firmware — the cheapest de-risk and the answer to DECISIONS #3.
+
+> **Transport: HTTP MJPEG + RTSP/H.264.** The reader auto-selects by URL scheme
+> (`app/rtsp.is_rtsp`): `http(s)://` → MJPEG (`app/mjpeg.py`, ESP32-CAM); `rtsp://` →
+> H.264 decoded via OpenCV's FFmpeg backend (`app/rtsp.py`, Reolink/Amcrest/Dahua/Tapo/
+> any ONVIF cam). RTSP needs opencv installed (reader) and, for codec-copy recording of
+> the main stream, `ffmpeg` on PATH — see requirements.txt. **Dual-stream:** point the
+> reader/detect stream at the cheap SUBSTREAM and give a `record_url` MAIN stream
+> (recorded by codec-copy — full quality, ~zero CPU); see the two-URL form below.
 
 Inject a non-declaring source two ways:
 
 **A — `VISION_STATIC_CAMERAS` escape hatch (no hub write).** A comma-list of
-`id@zone@url` (the URL is taken verbatim — http MJPEG or `rtsp://…`):
+`id@zone@url`; the reader picks MJPEG vs RTSP by scheme. For dual-stream, give two
+space-separated URLs — `<detect-substream> <record-mainstream>`:
 ```bash
-# a laptop/USB webcam served as MJPEG, an IP/RTSP cam, or the bare ESP32-CAM's /stream
+# MJPEG-HTTP (ESP32-CAM / webcam):
 VISION_STATIC_CAMERAS="lab@sala@http://192.168.1.50:81/stream" \
+  .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8130
+# RTSP, dual-stream (detect on stream2 / record stream1 by codec-copy):
+VISION_STATIC_CAMERAS="patio@garden@rtsp://user:pass@192.168.1.50:554/stream2 rtsp://user:pass@192.168.1.50:554/stream1" \
   .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8130
 ```
 These augment the roster (the roster wins on an id clash) and survive a hub outage.

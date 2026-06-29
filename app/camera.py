@@ -25,6 +25,7 @@ make that possible). The agent never sees frames; only the digested edges leave 
 """
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from typing import Dict, List, Optional
@@ -33,6 +34,7 @@ from . import ingest
 from .config import cfg
 from .hub_client import Camera
 from .mjpeg import iter_jpeg_frames, multipart_chunk, open_stream
+from .rtsp import is_rtsp, iter_rtsp_frames, redact_url
 from .occupancy import Identity, Observation, UNKNOWN
 from .perception import crop_jpeg, decode_jpeg, draw_overlay, make_detector, make_face_engine
 from .recorder import Recorder
@@ -45,7 +47,7 @@ class CameraWorker(threading.Thread):
         self.cam = cam
         self.detector = make_detector()
         self.face = make_face_engine()
-        self.recorder = Recorder(cam.id, cam.zone, index)
+        self.recorder = Recorder(cam.id, cam.zone, index, record_url=cam.record_url)
         # NB: not `_stop` — threading.Thread._stop is an internal METHOD it calls when a
         # thread finishes/joins; shadowing it with an Event breaks join() ("'Event' object
         # is not callable"). Same trap as _ident/_idents above.
@@ -110,9 +112,24 @@ class CameraWorker(threading.Thread):
         url = self.cam.stream_url
         if not url:
             raise RuntimeError("no stream url")
+        # Auto-select transport by URL scheme: rtsp:// (Reolink/Amcrest/Dahua/Tapo/ONVIF)
+        # decodes via OpenCV's FFmpeg backend; everything else is HTTP-MJPEG (ESP32-CAM).
+        if is_rtsp(url):
+            self.connected = True
+            print(f"[vision] cam {self.cam.id} streaming (rtsp) from {redact_url(url)}", flush=True)
+            try:
+                # closing() guarantees cap.release() when the reader stops/reconnects.
+                with contextlib.closing(iter_rtsp_frames(url, self._stop_evt.is_set)) as frames:
+                    for jpeg in frames:
+                        if self._stop_evt.is_set():
+                            break
+                        self._on_frame(jpeg)
+            finally:
+                self.connected = False
+            return
         resp = open_stream(url)
         self.connected = True
-        print(f"[vision] cam {self.cam.id} streaming from {url}", flush=True)
+        print(f"[vision] cam {self.cam.id} streaming (mjpeg) from {url}", flush=True)
         try:
             for jpeg in iter_jpeg_frames(resp.read):
                 if self._stop_evt.is_set():

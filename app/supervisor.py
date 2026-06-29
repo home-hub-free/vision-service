@@ -49,7 +49,8 @@ class Supervisor(threading.Thread):
         for cam_id in list(workers.keys()):
             w = workers[cam_id]
             cam = cams.get(cam_id)
-            if cam is None or getattr(w, "cam").stream_url != cam.stream_url:
+            if cam is None or getattr(w, "cam").stream_url != cam.stream_url \
+                    or getattr(w, "cam").record_url != cam.record_url:
                 getattr(w, "stop", lambda: None)()
                 del workers[cam_id]
 
