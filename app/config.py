@@ -71,6 +71,10 @@ class Config:
     rtsp_transport: str = field(default_factory=lambda: os.getenv("VISION_RTSP_TRANSPORT", "tcp"))
     rtsp_timeout_s: float = field(default_factory=lambda: _f("VISION_RTSP_TIMEOUT_S", 5.0))
     rtsp_max_read_misses: int = field(default_factory=lambda: _i("VISION_RTSP_MAX_READ_MISSES", 30))
+    # Wall-clock deadman: if no frame decodes for this long the reader raises so the worker
+    # reconnects — the count-based escape alone scales with the read timeout (each miss can
+    # block a full rtsp_timeout_s inside cap.read()), not with real time.
+    rtsp_stall_s: float = field(default_factory=lambda: _f("VISION_RTSP_STALL_S", 15.0))
 
     # ── ingestion (this service is its OWN MQTT producer — §5.2) ─────────────
     # Mirrors the hub's seam: publishes to homehub/<zone>/<camId>/<channel>, gated on
@@ -124,6 +128,18 @@ class Config:
     detect_fps: float = field(default_factory=lambda: _f("VISION_DETECT_FPS", 5.0))  # §11.1 GPU lever
     person_conf: float = field(default_factory=lambda: _f("VISION_PERSON_CONF", 0.4))
     face_match_threshold: float = field(default_factory=lambda: _f("VISION_FACE_THRESHOLD", 0.35))
+
+    # ── SCRFD face-detector sizing (the far/small-face levers) ────────────────
+    # `det_size` is the square SCRFD works at: 640 (the insightface default) throws away
+    # the detail that lets it find a DISTANT face; 1024–1280 recovers range at the cost of
+    # more CPU per detected NEW track (SCRFD only runs on new/unmatched tracks at
+    # detect_fps, so it's affordable). `det_thresh` is SCRFD's own confidence bar (its
+    # default is 0.5) — lower it to keep weak far-face detections. `face_min_px` is an
+    # optional post-detect gate: skip embedding a face whose bbox longest side is under
+    # this many pixels, so tiny low-detail faces don't seed noisy guest clusters. 0 = off.
+    face_det_size: int = field(default_factory=lambda: _i("VISION_FACE_DET_SIZE", 1024))
+    face_det_thresh: float = field(default_factory=lambda: _f("VISION_FACE_DET_THRESH", 0.4))
+    face_min_px: int = field(default_factory=lambda: _i("VISION_FACE_MIN_PX", 0))
 
     # Online reinforcement (§4.3): on a confident, UNAMBIGUOUS household match, fold the
     # live embedding into that member's centroid so passive recognition self-improves

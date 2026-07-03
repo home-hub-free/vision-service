@@ -59,7 +59,8 @@ def redact_url(url: str) -> str:
 def _capture_options() -> str:
     # TCP transport is the single most important RTSP-reliability knob: UDP drops/reorders
     # on busy Wi-Fi and corrupts H.264. `stimeout` (microseconds) bounds a dead-stream read
-    # so the worker reconnects instead of blocking forever.
+    # on older FFmpeg; newer FFmpeg renamed it and silently ignores it — the real bound is
+    # the CAP_PROP_*_TIMEOUT_MSEC params passed to VideoCapture (see iter_rtsp_frames).
     return f"rtsp_transport;{cfg.rtsp_transport}|stimeout;{int(cfg.rtsp_timeout_s * 1_000_000)}"
 
 
@@ -80,7 +81,15 @@ def iter_rtsp_frames(url: str, should_stop: Callable[[], bool]) -> Iterator[byte
 
     # Must be set before VideoCapture is constructed; the FFmpeg backend reads it from env.
     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = _capture_options()
-    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    # OPEN/READ_TIMEOUT drive OpenCV's FFmpeg interrupt callback (default 30s), which is
+    # what actually bounds a blocked read when the camera power-cycles under us. Without
+    # these, a dead stream took 30s/read x rtsp_max_read_misses (~15 min!) to surface to
+    # the reconnect loop — seen live 2026-07-03 as the MC200 "stalled" tile after a replug.
+    timeout_ms = int(cfg.rtsp_timeout_s * 1000)
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG, [
+        cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout_ms,
+        cv2.CAP_PROP_READ_TIMEOUT_MSEC, timeout_ms,
+    ])
     try:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # always the freshest frame, never a backlog
     except Exception:  # noqa: BLE001 — not every backend honors it
@@ -90,16 +99,22 @@ def iter_rtsp_frames(url: str, should_stop: Callable[[], bool]) -> Iterator[byte
         raise RuntimeError(f"could not open RTSP stream {redact_url(url)}")
     try:
         misses = 0
+        last_ok = time.monotonic()
         while not should_stop():
             ok, frame = cap.read()
             if not ok or frame is None:
                 # Tolerate a few transient read misses, then surface to the reconnect loop.
+                # The wall-clock deadman matters more than the count: each miss can burn a
+                # full read-timeout blocked inside cap.read(), so count-only escape scales
+                # with the timeout instead of with real time.
                 misses += 1
-                if misses > cfg.rtsp_max_read_misses:
+                stalled = time.monotonic() - last_ok > cfg.rtsp_stall_s
+                if misses > cfg.rtsp_max_read_misses or stalled:
                     raise RuntimeError(f"RTSP read failed repeatedly {redact_url(url)}")
                 time.sleep(0.05)
                 continue
             misses = 0
+            last_ok = time.monotonic()
             jpeg = encode_jpeg(frame)
             if jpeg:
                 yield jpeg

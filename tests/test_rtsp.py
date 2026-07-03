@@ -46,6 +46,41 @@ def test_rtsp_copy_args_is_codec_copy_no_reencode():
     assert "/rec/%Y.mp4" in joined and "/hls/live.m3u8" in joined
 
 
+def test_iter_rtsp_frames_deadman_escapes_dead_stream(monkeypatch):
+    """A camera power-cycle leaves cap.read() failing forever; the reader must raise to
+    the reconnect loop within rtsp_stall_s wall-clock — NOT after max_read_misses blocked
+    reads (each of which can burn a full read-timeout; that was the ~15-min MC200 stall)."""
+    cv2 = pytest.importorskip("cv2")
+    from app.config import cfg
+    captured = {}
+
+    class DeadCap:
+        def __init__(self, url, backend=None, params=None):
+            captured["params"] = params
+        def isOpened(self):
+            return True
+        def set(self, *a):
+            return True
+        def read(self):
+            return False, None
+        def release(self):
+            pass
+
+    monkeypatch.setattr(cv2, "VideoCapture", DeadCap)
+    monkeypatch.setattr(cfg, "rtsp_stall_s", 0.2)
+    monkeypatch.setattr(cfg, "rtsp_max_read_misses", 10_000_000)  # count alone won't save us
+    import time as _time
+    t0 = _time.monotonic()
+    with pytest.raises(RuntimeError, match="read failed"):
+        next(iter_rtsp_frames("rtsp://1.2.3.4/live", lambda: False))
+    assert _time.monotonic() - t0 < 5.0  # escaped on wall-clock, not miss count
+    # And the FFmpeg interrupt-callback bounds must be passed at construction (the env
+    # `stimeout` option is ignored by newer FFmpeg).
+    params = captured["params"]
+    assert cv2.CAP_PROP_OPEN_TIMEOUT_MSEC in params
+    assert cv2.CAP_PROP_READ_TIMEOUT_MSEC in params
+
+
 def test_iter_rtsp_frames_raises_without_opencv():
     try:
         import cv2  # noqa: F401
