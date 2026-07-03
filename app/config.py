@@ -78,6 +78,33 @@ class Config:
     ingestion_enabled: bool = field(default_factory=lambda: _b("VISION_INGESTION_ENABLED", True))
     mqtt_url: str = field(default_factory=lambda: os.getenv("MQTT_URL", "mqtt://127.0.0.1:1883"))
 
+    # ── ONVIF control seam (CAMERA_ONVIF_CONTROL_PLAN — PTZ/imaging/events/clock) ─
+    # The control seam lives HERE (plan §1): credentials are parsed from each camera's
+    # existing rtsp:// stream URL (never a second secret store), capabilities are probed
+    # per-camera (the C110s are fixed — events+imaging, no PTZ), and everything degrades
+    # per-capability. Port 2020 is the Tapo/Mercusys family default; override globally
+    # here (a per-camera override only gets built when a camera actually differs).
+    onvif_enabled: bool = field(default_factory=lambda: _b("VISION_ONVIF_ENABLED", True))
+    onvif_port: int = field(default_factory=lambda: _i("VISION_ONVIF_PORT", 2020))
+    onvif_timeout_s: float = field(default_factory=lambda: _f("VISION_ONVIF_TIMEOUT_S", 6.0))
+    # A continuous PTZ move is auto-stopped after its ttl; this caps the ttl a caller
+    # may request (plan §2: never leave a continuous move running).
+    ptz_max_ttl_s: float = field(default_factory=lambda: _f("VISION_PTZ_MAX_TTL_S", 2.0))
+    # In-camera motion/tamper via PullPoint (plan §3). Default on; per-camera it only
+    # activates when the capability probe says the camera actually emits events.
+    onvif_events_enabled: bool = field(default_factory=lambda: _b("VISION_ONVIF_EVENTS_ENABLED", True))
+    # 5s, not 10: the MC200 kills PullMessages sockets held ~10s+ on an idle scene
+    # (verified live 2026-07-03 — 10s pulls churned the subscription every ~21s;
+    # 3–5s pulls answer cleanly with an empty response).
+    onvif_pull_timeout_s: float = field(default_factory=lambda: _f("VISION_ONVIF_PULL_TIMEOUT_S", 5.0))
+    # Opt-in GPU/CPU saver: run the heavy perception pipeline only while the camera's
+    # own motion detector says something moved (+ linger). Default OFF — always-on
+    # detection stays the baseline; YOLO remains authoritative for *person*.
+    detect_on_motion: bool = field(default_factory=lambda: _b("VISION_DETECT_ON_MOTION", False))
+    motion_linger_s: float = field(default_factory=lambda: _f("VISION_MOTION_LINGER_S", 10.0))
+    # WAN-blocked cameras can't NTP → push the box clock daily (plan §6). 0 disables.
+    onvif_time_sync_h: float = field(default_factory=lambda: _f("VISION_ONVIF_TIME_SYNC_H", 24.0))
+
     # ── hub room-digest push (PERCEPTION_TO_AGENT_PLAN §3.1 — the agent-facing fusion) ─
     # Besides the MQTT producer (above, which feeds memory + the agent WAKE lane), we PUSH a
     # small per-zone occupancy+identity digest straight to the hub on every salient change, so

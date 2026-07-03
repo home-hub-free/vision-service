@@ -13,6 +13,10 @@ uvicorn[standard]>=0.29
 python-multipart>=0.0.9     # multipart image upload (Face-ID enroll)
 paho-mqtt>=1.6              # ingestion producer (homehub/<zone>/<cam>/<channel>)
 
+# ── dev/test only ──
+# pytest + httpx2 (starlette TestClient backend) drive the route tests:
+#   .venv/bin/pip install pytest httpx2
+
 # ── frame decode + annotation (needed once a real perception backend is on) ──
 # opencv-python-headless>=4.9   # decode JPEG + draw boxes/names for the annotated view
 # numpy>=1.26

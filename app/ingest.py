@@ -101,6 +101,15 @@ def _publish(zone: str, cam_id: str, channel: str, value, source: str, meta: Opt
         print(f"[vision] publish to {topic} failed: {e}", flush=True)
 
 
+def publish_signal(zone: str, cam_id: str, channel: str, value, meta: Optional[dict] = None) -> None:
+    """Publish one raw camera signal (ONVIF motion/tamper — CAMERA_ONVIF_CONTROL_PLAN §3)
+    on the same bus. `source` stays "device": the camera computed it autonomously. The
+    `provenance` meta ("camera_motion"/"camera_tamper") distinguishes it from YOLO-person
+    downstream. Routing is by CHANNEL name: `motion` is pull-lane (memory only — the
+    agent gate drops it like `occupancy`); `tamper` rides through and wakes the agent."""
+    _publish(zone, cam_id, channel, value, "device", meta)
+
+
 def publish_edge(edge: Edge, occupancy_count: int) -> None:
     """Map one salient occupancy edge onto the ingestion bus (§5.2). The agent lane's
     salience gate decides which of these actually wake it (§8); memory keeps all."""

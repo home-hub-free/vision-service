@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from .config import cfg
 from .ingest import init_ingestion
 from .retention import Janitor
-from .routes import enroll, guests, occupancy, streams
+from .routes import camctl, enroll, guests, imaging, occupancy, ptz, streams
 from .state import index
 from .supervisor import Supervisor
 
@@ -56,6 +56,10 @@ app.include_router(streams.router)
 app.include_router(occupancy.router)
 app.include_router(enroll.router)
 app.include_router(guests.router)
+# ONVIF control seam (CAMERA_ONVIF_CONTROL_PLAN): PTZ + imaging + per-camera summary.
+app.include_router(ptz.router)
+app.include_router(imaging.router)
+app.include_router(camctl.router)
 
 # HLS playback (§6/§11.5 alternative delivery) — the recorder writes live.m3u8 here.
 os.makedirs(cfg.hls_dir, exist_ok=True)

@@ -67,6 +67,16 @@ class CameraWorker(threading.Thread):
         self._proc_thread: Optional[threading.Thread] = None
         self._present = False  # set by the processor, read by the reader to gate recording
 
+        # ONVIF motion pre-gate state (CAMERA_ONVIF_CONTROL_PLAN §3), written by the
+        # camera's EventPuller (supervisor-owned), read by the processor loop. When
+        # `detect_on_motion` is on AND events are attached, the heavy pipeline only
+        # runs while the camera's own motion detector is active (+ linger); if the
+        # event subscription drops, `events_attached` falls false and the gate fails
+        # OPEN (back to always-on detection — never blind because a subscription died).
+        self.events_attached = False
+        self.motion_active = False
+        self.last_motion_ts = 0.0
+
         # per-track resolved identity cache (embed once per person, §4.1). Touched ONLY
         # by the processor thread. NB: must NOT be named `_ident` — this class subclasses
         # threading.Thread, which uses `self._ident` for the thread id and overwrites it
@@ -182,6 +192,8 @@ class CameraWorker(threading.Thread):
                         self._pending_frame = None
                 now = time.time()
             self._last_pipeline = now
+            if not self._motion_gate_open(now):
+                continue  # empty scene per the camera's own motion detector — skip inference
             try:
                 self._run_pipeline(jpeg, now)
             except Exception as e:  # noqa: BLE001 — a bad frame must never kill perception
@@ -237,6 +249,15 @@ class CameraWorker(threading.Thread):
         # Forget identities of tracks that aged out so the cache can't grow unbounded.
         self._prune_idents({t.track_id for t in tracks})
 
+    def _motion_gate_open(self, now: float) -> bool:
+        """The opt-in ONVIF-motion YOLO pre-gate (plan §3). Open unless the knob is
+        on AND a live event subscription says the scene is empty. Linger keeps the
+        pipeline running long enough after the last motion to see people leave
+        (keep it > leave_grace_s if you tighten it)."""
+        if not cfg.detect_on_motion or not self.events_attached:
+            return True
+        return self.motion_active or (now - self.last_motion_ts) < cfg.motion_linger_s
+
     def _prune_idents(self, live: set) -> None:
         if len(self._idents) > 256:
             self._idents = {k: v for k, v in self._idents.items() if k in live}
@@ -254,10 +275,19 @@ class CameraWorker(threading.Thread):
             time.sleep(0.05)
 
     def status(self) -> dict:
+        # Cached-only ONVIF capability summary (never a network probe from a poll
+        # path): None until the supervisor's probe succeeds, then e.g.
+        # {"ptz": true, "imaging": true, "events": true} — the dashboard uses it to
+        # decide which camera controls to draw (fixed cams get no D-pad).
+        onvif_client = getattr(self, "_onvif", None)
+        caps = onvif_client.capabilities_cached() if onvif_client else None
         return {
             "id": self.cam.id, "zone": self.cam.zone, "ip": self.cam.ip,
             "connected": self.connected, "frames_seen": self.frames_seen,
             "last_frame_age_s": round(time.time() - self.last_frame_ts, 1) if self.last_frame_ts else None,
             "detector": self.detector.backend, "face": self.face.backend,
             "rec_mode": self.recorder.mode,
+            "onvif": caps,
+            "events_attached": self.events_attached,
+            "motion_active": self.motion_active if self.events_attached else None,
         }
