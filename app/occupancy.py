@@ -20,9 +20,10 @@ observation, NOT automation/llm) and identity riding in `meta.identity` (§5.1).
 """
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .config import cfg
 
@@ -33,7 +34,16 @@ EDGE_IDENTIFIED = "person_identified"
 EDGE_GUEST_ARRIVED = "guest_arrived"
 EDGE_LEFT = "person_left"
 EDGE_ROOM_EMPTY = "room_empty"
-PUSH_EDGES = {EDGE_ENTERED, EDGE_IDENTIFIED, EDGE_GUEST_ARRIVED, EDGE_LEFT, EDGE_ROOM_EMPTY}
+# T1 fall-shaped signal (VISION_CONTEXT_TIERS_PLAN §3): lying, outside a lying-ok zone,
+# for longer than the dwell bar. Alert-only (no autonomy), once per lying episode.
+EDGE_POSTURE_ALERT = "posture_alert"
+PUSH_EDGES = {EDGE_ENTERED, EDGE_IDENTIFIED, EDGE_GUEST_ARRIVED, EDGE_LEFT, EDGE_ROOM_EMPTY,
+              EDGE_POSTURE_ALERT}
+
+# EMA weight for the per-track speed estimate (T0). One reading is noisy (bbox jitter
+# at 5 fps), so smooth; 0.4 settles in ~3 observations — fast enough to catch someone
+# starting to rush, slow enough that one jittery box doesn't flip `moving`.
+SPEED_EMA_ALPHA = 0.4
 
 
 @dataclass
@@ -61,6 +71,13 @@ class Observation:
     """One tracked person in one frame (output of the perception pipeline)."""
     track_id: str
     identity: Identity = field(default_factory=lambda: UNKNOWN)
+    # T0 (VISION_CONTEXT_TIERS_PLAN §2): the track's bbox in frame pixels + the frame
+    # width, so the tracker can keep a camera-agnostic speed (frame-widths/s). Optional:
+    # older callers/null builds omit them and dwell/speed simply stays unavailable.
+    bbox: Optional[Tuple[int, int, int, int]] = None
+    frame_w: int = 0
+    # T1 (§3): coarse body state from pose, when the pose engine ran on this frame.
+    posture: Optional[str] = None  # "standing" | "sitting" | "lying" | "bent"
 
 
 @dataclass
@@ -74,6 +91,16 @@ class _Track:
     present: bool = False
     identity: Identity = field(default_factory=lambda: UNKNOWN)
     announced_identity: Optional[str] = None  # identity key we've already pushed
+    # T0: EMA of bbox-center displacement, in frame-widths/s (camera-agnostic), plus
+    # the last width-normalized center + its timestamp the EMA differentiates against.
+    speed: float = 0.0
+    norm_cx: Optional[float] = None
+    norm_cy: Optional[float] = None
+    pos_ts: float = 0.0
+    # T1: latest posture read (pose frames only — persists between pose cadence ticks),
+    # and the once-per-lying-episode latch for the fall-shaped alert.
+    posture: Optional[str] = None
+    posture_alerted: bool = False
 
 
 @dataclass
@@ -126,6 +153,12 @@ class OccupancyTracker:
             tr.last_seen = now
             tr.hits += 1
             tr.identity = _better(tr.identity, obs.identity)
+            self._update_motion(tr, obs, now)
+            if obs.posture is not None:
+                tr.posture = obs.posture
+            alert = self._maybe_posture_alert(tr, now)
+            if alert is not None:
+                edges.append(alert)
 
             # Cross to "present" after enter_frames consecutive sightings (debounce).
             if not tr.present and tr.hits >= cfg.enter_frames:
@@ -169,6 +202,37 @@ class OccupancyTracker:
             edges.append(Edge(EDGE_ROOM_EMPTY, zone, "", "", UNKNOWN, now))
         self._zone_occupied[zone] = occupied
 
+    # ── T0 dwell/speed + T1 posture alert ─────────────────────────────────────
+    def _update_motion(self, tr: _Track, obs: Observation, now: float) -> None:
+        """EMA the track's speed from bbox-center displacement, normalized by frame
+        width (units: frame-widths/s — camera-agnostic). No bbox/width → no-op, so
+        the null build and older callers keep working with speed pinned at 0."""
+        if obs.bbox is None or obs.frame_w <= 0:
+            return
+        x1, y1, x2, y2 = obs.bbox
+        cx = ((x1 + x2) / 2.0) / obs.frame_w
+        cy = ((y1 + y2) / 2.0) / obs.frame_w  # width-normalized both axes: isotropic units
+        if tr.norm_cx is not None and tr.norm_cy is not None and now > tr.pos_ts:
+            inst = math.hypot(cx - tr.norm_cx, cy - tr.norm_cy) / (now - tr.pos_ts)
+            tr.speed = SPEED_EMA_ALPHA * inst + (1.0 - SPEED_EMA_ALPHA) * tr.speed
+        tr.norm_cx, tr.norm_cy, tr.pos_ts = cx, cy, now
+
+    def _maybe_posture_alert(self, tr: _Track, now: float) -> Optional[Edge]:
+        """Fall-shaped salience (§3): lying + zone not lying-ok + dwell past the bar →
+        one alert per lying episode (the latch re-arms when the posture changes)."""
+        if tr.posture != "lying":
+            tr.posture_alerted = False
+            return None
+        if tr.posture_alerted or not tr.present:
+            return None
+        if (now - tr.first_seen) < cfg.lying_alert_dwell_s:
+            return None
+        ok = {z.strip().lower() for z in cfg.lying_ok_zones.split(",") if z.strip()}
+        if tr.zone.lower() in ok:
+            return None
+        tr.posture_alerted = True
+        return self._mk(EDGE_POSTURE_ALERT, tr, now)
+
     # ── helpers ───────────────────────────────────────────────────────────────
     def _identify_edge(self, tr: _Track, now: float) -> Edge:
         edge = EDGE_GUEST_ARRIVED if tr.identity.cls == "guest" else EDGE_IDENTIFIED
@@ -183,18 +247,26 @@ class OccupancyTracker:
         return left_at is not None and (now - left_at) < cfg.rewake_cooldown_s
 
     # ── snapshot (pull surface — who_is_here) ─────────────────────────────────
-    def snapshot(self, zone: Optional[str] = None) -> dict:
+    def snapshot(self, zone: Optional[str] = None, now: Optional[float] = None) -> dict:
+        now = time.time() if now is None else now
         out: Dict[str, list] = {}
         for tr in self._tracks.values():
             if not tr.present:
                 continue
             if zone and tr.zone != zone:
                 continue
-            out.setdefault(tr.zone, []).append({
+            entry = {
                 "track": tr.key,
                 "since": tr.first_seen,
+                # T0 activity signals (§2): how long they've been here + whether they're
+                # in motion right now (speed EMA vs the passing bar, camera-agnostic).
+                "dwell_s": round(max(0.0, now - tr.first_seen), 1),
+                "moving": tr.speed >= cfg.activity_speed_fws,
                 **tr.identity.as_meta(),
-            })
+            }
+            if tr.posture:
+                entry["posture"] = tr.posture  # T1 (§3), only once a pose engine read it
+            out.setdefault(tr.zone, []).append(entry)
         return out
 
     def who_is_here(self, zone: Optional[str] = None) -> List[dict]:

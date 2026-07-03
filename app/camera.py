@@ -36,7 +36,9 @@ from .hub_client import Camera
 from .mjpeg import iter_jpeg_frames, multipart_chunk, open_stream
 from .rtsp import is_rtsp, iter_rtsp_frames, redact_url
 from .occupancy import Identity, Observation, UNKNOWN
-from .perception import crop_jpeg, decode_jpeg, draw_overlay, make_detector, make_face_engine
+from .perception import (classify_posture, crop_jpeg, decode_jpeg, draw_overlay,
+                         face_crop_jpeg, make_detector, make_face_engine,
+                         make_pose_engine, match_poses_to_tracks)
 from .recorder import Recorder
 from .state import gallery, index, tracker
 
@@ -47,6 +49,7 @@ class CameraWorker(threading.Thread):
         self.cam = cam
         self.detector = make_detector()
         self.face = make_face_engine()
+        self.pose = make_pose_engine()  # T1 (§3): null unless VISION_POSE_BACKEND is set
         self.recorder = Recorder(cam.id, cam.zone, index, record_url=cam.record_url)
         # NB: not `_stop` — threading.Thread._stop is an internal METHOD it calls when a
         # thread finishes/joins; shadowing it with an Event breaks join() ("'Event' object
@@ -83,6 +86,11 @@ class CameraWorker(threading.Thread):
         # on .start() (an int), breaking len() in _prune_idents. Use `_idents`.
         self._idents: Dict[str, Identity] = {}
         self._last_pipeline = 0.0
+        # T0/T1 digest cadence: pose sub-sampling counter (§3 cost-gate lever) and the
+        # occupied-zone heartbeat push clock (§2 — activity changes with no salient
+        # edge still reach the hub within digest_heartbeat_s, never per-frame).
+        self._pose_counter = 0
+        self._last_digest_push = 0.0
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
     def run(self) -> None:
@@ -204,21 +212,49 @@ class CameraWorker(threading.Thread):
         if frame is None:
             return  # null build (no cv2): presence-less M0 relay/record only
         tracks = self.detector.detect_and_track(frame)
+        frame_w = int(frame.shape[1])
+        # T1 pose pass (§3): only on frames that already have person tracks, same
+        # motion gate (we're past it), sub-sampled by pose_every_n (posture changes
+        # slowly — the cost-gate fallback runs pose every ~3rd detect frame).
+        postures: Dict[str, str] = {}
+        if tracks and getattr(self.pose, "backend", "null") != "null":
+            self._pose_counter += 1
+            if self._pose_counter % max(1, cfg.pose_every_n) == 0:
+                matched = match_poses_to_tracks(self.pose.detect(frame), tracks)
+                for tid, kps in matched.items():
+                    tbox = next(t.bbox for t in tracks if t.track_id == tid)
+                    posture = classify_posture(kps, tbox)
+                    if posture:
+                        postures[tid] = posture
         labels: Dict[str, str] = {}
         observations: List[Observation] = []
         for t in tracks:
             ident = self._idents.get(t.track_id)
             # Embed + resolve once per track, then re-try only while still unknown.
             if ident is None or ident.cls == "unknown":
-                emb = self.face.embed(frame, t.bbox)
+                # Prefer the face-box-aware path: the stored thumbnail is then a
+                # face-CENTERED crop of exactly the matched face (never a full-body
+                # sliver, never an ambiguous two-person box), and the face's position
+                # within it rides along so the review card can ring it.
+                emb, thumb, thumb_box = None, None, None
+                if hasattr(self.face, "embed_face"):
+                    hit = self.face.embed_face(frame, t.bbox)
+                    if hit is not None:
+                        emb, fbox = hit
+                        packed = face_crop_jpeg(frame, fbox)
+                        if packed is not None:
+                            thumb, thumb_box = packed
+                else:  # engines without the face-box API — old person-crop behavior
+                    emb = self.face.embed(frame, t.bbox)
                 if emb is not None:
-                    # Capture a face/person crop so every default-id'd person carries a
-                    # thumbnail the dashboard can show (admin labels from the face).
-                    ident = gallery.resolve(emb, crop_jpeg(frame, t.bbox))
+                    ident = gallery.resolve(emb, thumb or crop_jpeg(frame, t.bbox),
+                                            thumb_box=thumb_box)
                 else:
                     ident = ident or UNKNOWN
                 self._idents[t.track_id] = ident
-            observations.append(Observation(track_id=t.track_id, identity=ident))
+            observations.append(Observation(track_id=t.track_id, identity=ident,
+                                            bbox=t.bbox, frame_w=frame_w,
+                                            posture=postures.get(t.track_id)))
             # Live overlay label: real name if known, else the default "Person N" for a
             # guest cluster (every detected person is labelled by default), else "person".
             if ident.name:
@@ -229,7 +265,7 @@ class CameraWorker(threading.Thread):
                 labels[t.track_id] = "person"
 
         edges = tracker.update(self.cam.id, self.cam.zone, observations, now)
-        zone_people = tracker.snapshot(self.cam.zone).get(self.cam.zone, [])
+        zone_people = tracker.snapshot(self.cam.zone, now=now).get(self.cam.zone, [])
         count = len(zone_people)
         self._present = count > 0  # reader reads this to drive gated recording
         for edge in edges:
@@ -238,8 +274,11 @@ class CameraWorker(threading.Thread):
         # On any salient change, push the per-zone occupancy+identity digest to the hub so it
         # FUSES it into the `rooms` world-model the agent reads (§3.1). Edges already debounce —
         # so this fires once per arrival/leave, not per frame. Best-effort; never throws.
-        if edges:
+        # T0 (§2): while the zone stays occupied with no edges, a heartbeat re-push keeps the
+        # hub's dwell/activity fresh (and its vision TTL alive) — still never per-frame.
+        if edges or (zone_people and now - self._last_digest_push >= cfg.digest_heartbeat_s):
             hub_push.push_room(self.cam.zone, zone_people)
+            self._last_digest_push = now
 
         # Annotated frame for the dashboard's "who is here" view (§6).
         if tracks:
@@ -286,6 +325,7 @@ class CameraWorker(threading.Thread):
             "connected": self.connected, "frames_seen": self.frames_seen,
             "last_frame_age_s": round(time.time() - self.last_frame_ts, 1) if self.last_frame_ts else None,
             "detector": self.detector.backend, "face": self.face.backend,
+            "pose": self.pose.backend,
             "rec_mode": self.recorder.mode,
             "onvif": caps,
             "events_attached": self.events_attached,

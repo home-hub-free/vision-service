@@ -29,28 +29,74 @@ from typing import List, Optional
 from .config import cfg
 
 
+# T0 zone-activity states (VISION_CONTEXT_TIERS_PLAN §2) — pure thresholds over the
+# dwell/speed the tracker already keeps. No model, ~0 ms.
+ACTIVITY_PASSING = "passing"
+ACTIVITY_LINGERING = "lingering"
+ACTIVITY_SETTLED = "settled"
+
+
+def _person_activity(dwell_s: float, moving: bool) -> str:
+    """"Rushing past" vs "settled in the room" (§2): short dwell OR in motion = passing;
+    past the settle bar at low speed = settled; the in-between is lingering."""
+    if moving or dwell_s < cfg.activity_pass_dwell_s:
+        return ACTIVITY_PASSING
+    if dwell_s >= cfg.activity_settle_dwell_s:
+        return ACTIVITY_SETTLED
+    return ACTIVITY_LINGERING
+
+
+def zone_activity(snapshot_people: List[dict]) -> Optional[str]:
+    """Zone activity = the max-dwell person's state (§2), upgraded with their posture
+    when T1 read one ("settled+sitting"). None when nobody carries dwell data (null
+    build / no bbox), so the field is simply omitted from the digest."""
+    best = None
+    for p in snapshot_people:
+        if p.get("dwell_s") is None:
+            continue
+        if best is None or p["dwell_s"] > best["dwell_s"]:
+            best = p
+    if best is None:
+        return None
+    act = _person_activity(best["dwell_s"], bool(best.get("moving")))
+    posture = best.get("posture")
+    return f"{act}+{posture}" if posture else act
+
+
 def room_digest_payload(zone: str, snapshot_people: List[dict]) -> dict:
     """Pure builder: a zone's `tracker.snapshot(zone)` people list → the /perception body.
 
     `snapshot_people` is the per-zone list `OccupancyTracker.snapshot()` returns (each entry
     is `identity.as_meta()` + track/since). We keep ONLY the resolved-identity fields — id,
-    name, class, confidence — and drop everything biometric/track-internal. Unknowns ride
-    along (class "unknown", name null) so the hub/agent can COUNT them without naming them."""
-    people = [
-        {
+    name, class, confidence — plus the T0/T1 activity signals (dwell_s, moving, posture),
+    and drop everything biometric/track-internal. Unknowns ride along (class "unknown",
+    name null) so the hub/agent can COUNT them without naming them."""
+    people = []
+    for p in snapshot_people:
+        person = {
             "id": p.get("id"),
             "name": p.get("name"),
             "class": p.get("class") or "unknown",
             "confidence": p.get("confidence") or 0.0,
         }
-        for p in snapshot_people
-    ]
-    return {
+        # T0/T1 fields are additive — the hub tolerates their absence (older producer)
+        # and their presence (older hub just ignores unknown fields).
+        if p.get("dwell_s") is not None:
+            person["dwell_s"] = p["dwell_s"]
+            person["moving"] = bool(p.get("moving"))
+        if p.get("posture"):
+            person["posture"] = p["posture"]
+        people.append(person)
+    body = {
         "zone": zone,
         "count": len(people),
         "occupied": len(people) > 0,
         "people": people,
     }
+    activity = zone_activity(snapshot_people)
+    if activity:
+        body["activity"] = activity
+    return body
 
 
 def _svc_headers() -> dict:

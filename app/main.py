@@ -19,9 +19,10 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import cfg
 from .ingest import init_ingestion
+from .perception import annotate_face_in_thumb
 from .retention import Janitor
 from .routes import camctl, enroll, guests, imaging, occupancy, ptz, streams
-from .state import index
+from .state import gallery, index
 from .supervisor import Supervisor
 
 _supervisor: Supervisor | None = None
@@ -32,6 +33,10 @@ _janitor: Janitor | None = None
 async def lifespan(_app: FastAPI):
     global _supervisor, _janitor
     init_ingestion()
+    # Legacy guest thumbs (full-person crops) get their face located lazily at
+    # review time — wire the perception-backed annotator into the gallery here so
+    # gallery.py itself stays free of cv2/model imports (null-build posture).
+    gallery.thumb_annotator = annotate_face_in_thumb
     _supervisor = Supervisor()
     _supervisor.start()
     _janitor = Janitor(index)

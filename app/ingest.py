@@ -25,7 +25,7 @@ from typing import Optional
 
 from .config import cfg
 from .occupancy import (EDGE_ENTERED, EDGE_GUEST_ARRIVED, EDGE_IDENTIFIED,
-                        EDGE_LEFT, EDGE_ROOM_EMPTY, Edge)
+                        EDGE_LEFT, EDGE_POSTURE_ALERT, EDGE_ROOM_EMPTY, Edge)
 
 _client = None
 _connected = False
@@ -120,6 +120,11 @@ def publish_edge(edge: Edge, occupancy_count: int) -> None:
         _publish(edge.zone, edge.cam_id, "person", True, "device", meta_edge)
     elif edge.edge in _PERSON_FALSE:
         _publish(edge.zone, edge.cam_id, "person", False, "device", meta_edge)
+    elif edge.edge == EDGE_POSTURE_ALERT:
+        # T1 fall-shaped signal (VISION_CONTEXT_TIERS_PLAN §3): its own channel so
+        # Node-RED can route it like `tamper` (through to the agent lane) once the
+        # flow adds the route; memory keeps it either way. Alert-only, no autonomy.
+        _publish(edge.zone, edge.cam_id, "posture_alert", True, "device", meta_edge)
     # Occupancy count snapshot rides every edge (pull-lane signal; deadbanded downstream).
     _publish(edge.zone, edge.cam_id, "occupancy", occupancy_count, "device", {"edge": edge.edge})
 

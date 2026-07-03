@@ -137,6 +137,31 @@ class Config:
     face_reinforce_margin: float = field(default_factory=lambda: _f("VISION_FACE_REINFORCE_MARGIN", 0.08))
     face_reinforce_cap: int = field(default_factory=lambda: _i("VISION_FACE_REINFORCE_CAP", 50))
 
+    # ── T0 activity: dwell + speed (VISION_CONTEXT_TIERS_PLAN §2 — no model) ──
+    # Zone activity is classified from data the tracker already has: `passing` when
+    # dwell is short OR the speed EMA is above the bar; `settled` past the settle
+    # dwell at low speed; `lingering` between. Speed is in frame-widths/s.
+    activity_pass_dwell_s: float = field(default_factory=lambda: _f("VISION_ACTIVITY_PASS_DWELL_S", 20.0))
+    activity_settle_dwell_s: float = field(default_factory=lambda: _f("VISION_ACTIVITY_SETTLE_DWELL_S", 60.0))
+    activity_speed_fws: float = field(default_factory=lambda: _f("VISION_ACTIVITY_SPEED_FWS", 0.25))
+    # Occupied-zone digest heartbeat: activity/dwell changes with no salient edge still
+    # reach the hub within this period (and keep the hub's vision TTL fresh). Edges
+    # remain the primary push; this is NOT per-frame spam.
+    digest_heartbeat_s: float = field(default_factory=lambda: _f("VISION_DIGEST_HEARTBEAT_S", 30.0))
+
+    # ── T1 posture: pose → body state (plan §3 — CPU, motion-gated, cost-gated) ─
+    # "null" ships the tier dark; "ultralytics" runs yolov8n-pose on the SAME cadence
+    # as detect, only on frames that already have person tracks. `pose_every_n` is the
+    # §3 cost-gate lever: N>1 runs pose every Nth detect frame (posture changes slowly).
+    pose_backend: str = field(default_factory=lambda: os.getenv("VISION_POSE_BACKEND", "null"))
+    pose_every_n: int = field(default_factory=lambda: _i("VISION_POSE_EVERY_N", 1))
+    pose_min_kp_conf: float = field(default_factory=lambda: _f("VISION_POSE_MIN_KP_CONF", 0.3))
+    # Fall-shaped alert (§3): `lying` outside these zones for longer than the dwell bar
+    # emits one posture_alert edge per episode. Alert-only — no autonomy attached.
+    lying_ok_zones: str = field(default_factory=lambda: os.getenv(
+        "VISION_LYING_OK_ZONES", "bedroom,recamara,cuarto,living,sala"))
+    lying_alert_dwell_s: float = field(default_factory=lambda: _f("VISION_LYING_ALERT_DWELL_S", 60.0))
+
     # ── occupancy debounce (§4.3 / §8 — fire once per arrival, not per frame) ─
     enter_frames: int = field(default_factory=lambda: _i("VISION_ENTER_FRAMES", 3))   # consecutive hits → present
     leave_grace_s: float = field(default_factory=lambda: _f("VISION_LEAVE_GRACE_S", 6.0))  # gone this long → left
@@ -166,6 +191,20 @@ class Config:
     guest_cluster_threshold: float = field(default_factory=lambda: _f("VISION_GUEST_CLUSTER_THRESHOLD", 0.5))
     guest_min_sightings: int = field(default_factory=lambda: _i("VISION_GUEST_MIN_SIGHTINGS", 3))  # surface to review
     guest_ttl_days: int = field(default_factory=lambda: _i("VISION_GUEST_TTL_DAYS", 30))
+
+    # ── review tiers (self-healing gallery — how a guest cluster resolves) ───
+    # Each unpromoted cluster is scored against the household centroids and lands in
+    # one of three tiers:
+    #   score ≥ autoheal_threshold (+margin) → "definitely them": silently merged into
+    #     that member, never shown to anyone (same strictness posture as reinforce).
+    #   score ≥ suggest_threshold            → "probably them": surfaced as an
+    #     "Is this you?" card addressed to that member only.
+    #   below                                 → unknown: surfaced to every member.
+    # A member answering "No" is recorded per-cluster and permanently blocks both
+    # suggesting AND auto-healing that cluster into them.
+    face_autoheal_threshold: float = field(default_factory=lambda: _f("VISION_FACE_AUTOHEAL_THRESHOLD", 0.5))
+    face_autoheal_margin: float = field(default_factory=lambda: _f("VISION_FACE_AUTOHEAL_MARGIN", 0.08))
+    face_suggest_threshold: float = field(default_factory=lambda: _f("VISION_FACE_SUGGEST_THRESHOLD", 0.2))
 
     def __post_init__(self) -> None:
         for d in (DATA, self.rec_dir, self.hls_dir):
