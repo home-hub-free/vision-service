@@ -369,8 +369,21 @@ class _InsightFaceEngine:
         from insightface.app import FaceAnalysis  # type: ignore
         providers = os.getenv("VISION_ORT_PROVIDERS", "CPUExecutionProvider").split(",")
         self._app = FaceAnalysis(name=os.getenv("VISION_FACE_MODEL", "buffalo_l"), providers=providers)
-        self._app.prepare(ctx_id=0 if "CPU" not in providers[0] else -1, det_size=(640, 640))
-        print(f"[vision] insightface buffalo_l providers={providers}", flush=True)
+        # det_size / det_thresh are the far-face levers (see config.py): a larger square
+        # finds smaller/more-distant faces, a lower threshold keeps weak ones. min_px gates
+        # out faces too small to embed cleanly (0 = keep everything).
+        det = max(160, cfg.face_det_size)
+        self._min_px = max(0, cfg.face_min_px)
+        self._app.prepare(ctx_id=0 if "CPU" not in providers[0] else -1,
+                          det_size=(det, det), det_thresh=cfg.face_det_thresh)
+        print(f"[vision] insightface buffalo_l providers={providers} "
+              f"det_size={det} det_thresh={cfg.face_det_thresh} min_px={self._min_px}", flush=True)
+
+    def _too_small(self, box) -> bool:
+        """True when a detected face bbox is smaller than the min_px gate (longest side)."""
+        if self._min_px <= 0:
+            return False
+        return max(box[2] - box[0], box[3] - box[1]) < self._min_px
 
     def embed(self, frame, bbox: BBox) -> Optional[List[float]]:
         hit = self.embed_face(frame, bbox)
@@ -389,8 +402,8 @@ class _InsightFaceEngine:
             return None
         face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
         emb = getattr(face, "normed_embedding", None)
-        if emb is None:
-            return None
+        if emb is None or self._too_small(face.bbox):
+            return None  # no face, or too small/low-detail to embed cleanly
         fx1, fy1, fx2, fy2 = (int(v) for v in face.bbox)
         return emb.tolist(), (ox + fx1, oy + fy1, ox + fx2, oy + fy2)
 

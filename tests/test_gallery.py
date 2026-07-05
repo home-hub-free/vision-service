@@ -405,3 +405,103 @@ def test_merge_guests_guards():
     assert g.merge_guests("guest:2", "guest:1") == 2
     assert g.get_thumb("guest:1") == b"SRC-FACE"             # dst had none → src's rides over
     assert g.merge_guests("guest:2", "guest:1") is None      # already absorbed
+
+
+def test_threshold_override_roundtrip():
+    from app.config import cfg
+    g = _g()
+    default = float(cfg.face_autoheal_threshold)
+    # No override → effective == default.
+    assert g._thr("face_autoheal_threshold") == default
+    g.set_thresholds({"face_autoheal_threshold": 0.77, "bogus_key": 1.0})
+    assert g._thr("face_autoheal_threshold") == 0.77
+    view = {t["key"]: t for t in g.thresholds()}
+    assert view["face_autoheal_threshold"]["overridden"] is True
+    assert view["face_autoheal_threshold"]["value"] == 0.77
+    assert "bogus_key" not in view  # unknown keys ignored
+    # Clearing restores the default.
+    g.set_thresholds({"face_autoheal_threshold": "default"})
+    assert g._thr("face_autoheal_threshold") == default
+    assert {t["key"]: t for t in g.thresholds()}["face_autoheal_threshold"]["overridden"] is False
+
+
+def test_member_clusters_and_detach():
+    from app.config import cfg
+    cfg.face_match_threshold = 0.9
+    cfg.guest_cluster_threshold = 0.9
+    g = _g()
+    g.enroll("u1", "David", _vec(1.0))
+    # A guest cluster promoted into the member = an audit-trail entry.
+    g._cluster_guest(_vec(1.0), thumb=b"jpegbytes")
+    gid = "guest:1"
+    assert g.promote_guest(gid, "u1", "David") is True
+    clusters = g.member_clusters("u1")
+    assert len(clusters) == 1 and clusters[0]["guest_id"] == gid
+    assert clusters[0]["score"] is not None and clusters[0]["has_thumb"] is True
+    # "That wasn't me": detach un-promotes, blocks re-heal, returns to review.
+    member = g.detach_cluster(gid)
+    assert member == "u1"
+    assert g.member_clusters("u1") == []
+    q = g.review_queue()["queue"]
+    assert any(c["guest_id"] == gid for c in q)  # back in the review queue
+    # And it will never auto-heal back into u1.
+    row = next(c for c in q if c["guest_id"] == gid)
+    assert "u1" in row["rejected_user_ids"]
+    # Detaching a non-promotion is a no-op.
+    assert g.detach_cluster("guest:999") is None
+
+
+def test_guest_ids_never_reused_after_delete():
+    # ids come from MAX+1, not COUNT+1 — after a delete COUNT falls below the top
+    # id and COUNT+1 collides with a live row (UNIQUE violation → clustering dead).
+    cfg.face_match_threshold = 0.99
+    cfg.guest_cluster_threshold = 0.999999
+    g = _g()
+    g.resolve(_vec(1.0))  # guest:1
+    g.resolve(_vec(2.0))  # guest:2
+    g.forget_guest("guest:1")
+    ident = g.resolve(_vec(3.0))  # COUNT+1 would collide with guest:2
+    assert ident.cls == "guest" and ident.id == "guest:3"
+
+
+def _two_close_members(g):
+    # u2 sits close to u1 (cos(u1,u2)=0.9) so a u1-perfect probe scores 1.0 vs u1
+    # and 0.9 vs u2 — margin 0.1, an ambiguous zone we can gate on.
+    e1, e2 = _vec(1.0), _vec(2.0)
+    g.enroll("u1", "A", e1)
+    g.enroll("u2", "B", [0.9 * a + 0.4359 * b for a, b in zip(e1, e2)])
+
+
+def test_ambiguous_household_match_takes_guest_path():
+    cfg.face_match_threshold = 0.5
+    cfg.face_match_margin = 0.2  # demand a decisive win
+    cfg.guest_cluster_threshold = 0.999999
+    cfg.face_autoheal_threshold = 2.0  # isolate the match gate from autoheal
+    g = _g()
+    _two_close_members(g)
+    ident = g.resolve(_vec(1.0))  # scores ~1.0 vs u1, ~0.9 vs u2 → margin ~0.1 < 0.2
+    assert ident.cls == "guest"  # ambiguous → review ladder, never a silent label
+    cfg.face_match_margin = 0.05  # decisive enough now
+    ident = g.resolve(_vec(1.0))
+    assert ident.cls == "household" and ident.id == "u1"
+
+
+def test_recheck_is_margin_gated_and_side_effect_free():
+    cfg.face_match_threshold = 0.5
+    cfg.face_match_margin = 0.2
+    cfg.face_reinforce = True
+    g = _g()
+    _two_close_members(g)
+    before = {p["user_id"]: p["samples"] for p in g.profiles()}
+    # Ambiguous probe → None (keep the cached label), decisively-u2 probe → u2.
+    assert g.recheck(_vec(1.0)) is None
+    probe_u2 = [0.9 * a + 0.4359 * b for a, b in zip(_vec(1.0), _vec(2.0))]
+    # u1 and u2 are 0.9-similar, so even a u2-perfect probe only wins by ~0.1 —
+    # still None at margin 0.2, decisive once the bar reflects the roster.
+    assert g.recheck(probe_u2) is None
+    cfg.face_match_margin = 0.05
+    fresh = g.recheck(probe_u2)
+    assert fresh is not None and fresh.id == "u2" and fresh.cls == "household"
+    # No side effects ever: no guest clusters seeded, no reinforcement folded in.
+    assert g.guests() == []
+    assert {p["user_id"]: p["samples"] for p in g.profiles()} == before

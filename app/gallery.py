@@ -101,9 +101,83 @@ class Gallery:
             # NULL = not known yet (legacy thumb, annotated lazily); "[]" = the engine
             # looked and found no face (don't re-run).
             self._ensure_column(conn, "guests", "thumb_box", "TEXT")
+            # Runtime-adjustable recognition thresholds (the auto-heal/match/suggest
+            # knobs). Empty = use the config.py/env defaults; a row overrides it live so
+            # the household can tune from Settings without a redeploy. See `thresholds()`.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             conn.commit()
         finally:
             conn.close()
+
+    # ── runtime-adjustable thresholds (Settings ▸ Face recognition) ───────────
+    # Name → config.py default. These are the levers that decide how eagerly a live
+    # face matches a member, self-reinforces, clusters as a guest, and auto-heals. The
+    # effective value is a `settings` override when present, else the cfg default — so
+    # the resolver reads them live and the dashboard can show + edit them.
+    _TUNABLES = (
+        "face_match_threshold", "face_match_margin",
+        "face_reinforce_threshold", "face_reinforce_margin",
+        "guest_cluster_threshold", "face_autoheal_threshold", "face_autoheal_margin",
+        "face_suggest_threshold",
+    )
+
+    def _thr(self, name: str) -> float:
+        """Effective value of a tunable threshold: DB override if set, else cfg default."""
+        default = float(getattr(cfg, name))
+        conn = self._db()
+        try:
+            row = conn.execute("SELECT value FROM settings WHERE key=?", (name,)).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return default
+        try:
+            return float(row[0])
+        except (ValueError, TypeError):
+            return default
+
+    def thresholds(self) -> List[dict]:
+        """Every tunable threshold with its effective value, the code default, and
+        whether it's currently overridden — the payload the Settings panel renders."""
+        conn = self._db()
+        try:
+            overrides = {k: v for k, v in conn.execute("SELECT key, value FROM settings")}
+        finally:
+            conn.close()
+        out = []
+        for name in self._TUNABLES:
+            default = round(float(getattr(cfg, name)), 4)
+            overridden = name in overrides
+            try:
+                value = float(overrides[name]) if overridden else default
+            except (ValueError, TypeError):
+                value, overridden = default, False
+            out.append({"key": name, "value": round(value, 4),
+                        "default": default, "overridden": overridden})
+        return out
+
+    def set_thresholds(self, updates: dict) -> List[dict]:
+        """Persist threshold overrides. A value of None (or the string "default") CLEARS
+        the override, falling back to the code default. Unknown keys are ignored. Returns
+        the fresh `thresholds()` view."""
+        with _lock:
+            conn = self._db()
+            try:
+                for key, val in updates.items():
+                    if key not in self._TUNABLES:
+                        continue
+                    if val is None or val == "default":
+                        conn.execute("DELETE FROM settings WHERE key=?", (key,))
+                        continue
+                    conn.execute(
+                        "INSERT INTO settings (key, value) VALUES (?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (key, str(float(val))))
+                conn.commit()
+            finally:
+                conn.close()
+        return self.thresholds()
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, col: str, decl: str) -> None:
@@ -269,7 +343,7 @@ class Gallery:
                     s = _cosine(emb, json.loads(blob))
                     if s > best_s:
                         best_id, best_blob, best_n, best_s = gid, blob, n, s
-                if best_id is not None and best_s >= cfg.guest_cluster_threshold:
+                if best_id is not None and best_s >= self._thr("guest_cluster_threshold"):
                     merged = _running_mean(json.loads(best_blob), best_n, emb)
                     if thumb:
                         # Backfill a missing thumb — and REPLACE a bad one: if the
@@ -298,7 +372,13 @@ class Gallery:
                     name = conn.execute("SELECT name FROM guests WHERE guest_id=?", (best_id,)).fetchone()[0]
                     return best_id, name, best_n + 1
                 # New guest cluster — every distinct person gets a default id here.
-                seq = conn.execute("SELECT COUNT(*) FROM guests").fetchone()[0] + 1
+                # MAX+1, not COUNT+1: after any deletion COUNT falls below the top id
+                # and COUNT+1 collides with an existing row (UNIQUE violation), which
+                # killed clustering entirely until the ids realigned.
+                row = conn.execute(
+                    "SELECT MAX(CAST(substr(guest_id, 7) AS INTEGER)) FROM guests "
+                    "WHERE guest_id LIKE 'guest:%'").fetchone()
+                seq = (row[0] or 0) + 1
                 gid = f"guest:{seq}"
                 conn.execute(
                     "INSERT INTO guests (guest_id, name, embedding, sightings, thumb, thumb_box) VALUES (?,?,?,1,?,?)",
@@ -396,6 +476,91 @@ class Gallery:
         # Seed the member's face profile from the cluster centroid + carry its face image.
         self.enroll(user_id, name, json.loads(row[0]), thumb=row[1] if carry_thumb else None)
         return True
+
+    def member_clusters(self, user_id: str) -> List[dict]:
+        """Every guest cluster that was folded INTO a household member (by auto-heal or
+        a manual promote) — the audit trail behind that member's face profile. Each row
+        carries its captured thumb + how well it still matches the member's centroid
+        (`score`), so a reviewer can spot an outlier the thresholds got wrong and detach
+        it. Ordered worst-match first (the likeliest mistakes float to the top)."""
+        member = self._best_member_embedding(user_id)
+        conn = self._db()
+        try:
+            rows = conn.execute(
+                """SELECT guest_id, embedding, sightings, thumb, thumb_box,
+                          first_seen, last_seen
+                   FROM guests WHERE promoted_user_id=? ORDER BY last_seen DESC""",
+                (user_id,)).fetchall()
+        finally:
+            conn.close()
+        out = []
+        for gid, blob, sightings, thumb, box_raw, first_seen, last_seen in rows:
+            emb = json.loads(blob)
+            score = round(_cosine(emb, member), 3) if member else None
+            # Which face the thumb is about (legacy full-person crops hold several) —
+            # located up front on capture, or lazily here for old thumbs; so the
+            # full-image viewer can ring exactly this cluster's face.
+            face_box, no_face = self._face_box_for(gid, thumb, box_raw, emb)
+            out.append({
+                "guest_id": gid, "sightings": sightings,
+                "has_thumb": thumb is not None,
+                "first_seen": first_seen, "last_seen": last_seen,
+                "score": score,
+                "face_box": face_box, "no_face": no_face,
+            })
+        out.sort(key=lambda r: (r["score"] is None, r["score"] if r["score"] is not None else 0.0))
+        return out
+
+    def _best_member_embedding(self, user_id: str) -> Optional[List[float]]:
+        conn = self._db()
+        try:
+            row = conn.execute("SELECT embedding FROM faces WHERE user_id=?", (user_id,)).fetchone()
+        finally:
+            conn.close()
+        return json.loads(row[0]) if row else None
+
+    def detach_cluster(self, guest_id: str) -> Optional[str]:
+        """"This one wasn't me." Reverse an auto-heal/promote of a HOUSEHOLD member:
+          * best-effort un-merge the cluster's contribution from the member centroid
+            (weight 1 — the inverse of how promote_guest folded it in via enroll's
+            running-mean; a single cluster among many barely moves a seasoned centroid,
+            which is intended: one bad fold shouldn't wreck an identity),
+          * clear the promotion + name so the cluster re-enters the review queue,
+          * record the member in the cluster's rejected set so it never auto-heals back.
+        Returns the member id it was detached from, or None if the cluster isn't a
+        member promotion (missing, or merged into a NAMED guest — handled elsewhere)."""
+        with _lock:
+            conn = self._db()
+            try:
+                row = conn.execute(
+                    "SELECT embedding, promoted_user_id, rejected_user_ids FROM guests WHERE guest_id=?",
+                    (guest_id,)).fetchone()
+                if not row or not row[1]:
+                    return None
+                member = row[1]
+                face = conn.execute(
+                    "SELECT embedding, samples FROM faces WHERE user_id=?", (member,)).fetchone()
+                if not face:
+                    return None  # promoted into a named guest, not a member — not our case
+                c_emb = json.loads(row[0])
+                m_emb, m_n = json.loads(face[0]), int(face[1])
+                if m_n > 1:
+                    # inverse running-mean: recover the centroid before this weight-1 fold.
+                    unmerged = _normalise([(m_emb[i] * m_n - c_emb[i]) / (m_n - 1)
+                                           for i in range(len(m_emb))])
+                    conn.execute(
+                        "UPDATE faces SET embedding=?, samples=?, updated_at=datetime('now') WHERE user_id=?",
+                        (json.dumps(unmerged), m_n - 1, member))
+                rejected = self._parse_rejected(row[2])
+                rejected.add(member)
+                conn.execute(
+                    """UPDATE guests SET promoted_user_id=NULL, name=NULL, rejected_user_ids=?,
+                           last_seen=datetime('now') WHERE guest_id=?""",
+                    (json.dumps(sorted(rejected)), guest_id))
+                conn.commit()
+                return member
+            finally:
+                conn.close()
 
     def merge_guests(self, src_id: str, dst_id: str) -> Optional[int]:
         """Fold cluster `src` into (named) guest `dst` — the guest-side twin of
@@ -505,8 +670,8 @@ class Gallery:
         kind, tid, tname, score, margin = self._best_identity(
             json.loads(row[0]), exclude=self._parse_rejected(row[1]),
             exclude_guest=guest_id)
-        if (tid is None or score < cfg.face_autoheal_threshold
-                or margin < cfg.face_autoheal_margin):
+        if (tid is None or score < self._thr("face_autoheal_threshold")
+                or margin < self._thr("face_autoheal_margin")):
             return None
         if kind == "member":
             self.promote_guest(guest_id, tid, tname, carry_thumb=False)
@@ -538,8 +703,8 @@ class Gallery:
             rejected = self._parse_rejected(rejected_raw)
             kind, tid, tname, score, margin = self._best_identity(
                 emb, exclude=rejected, exclude_guest=gid)
-            if (tid is not None and score >= cfg.face_autoheal_threshold
-                    and margin >= cfg.face_autoheal_margin):
+            if (tid is not None and score >= self._thr("face_autoheal_threshold")
+                    and margin >= self._thr("face_autoheal_margin")):
                 if kind == "member":
                     self.promote_guest(gid, tid, tname, carry_thumb=False)
                 else:
@@ -548,7 +713,7 @@ class Gallery:
                                "name": tname, "score": round(score, 3)})
                 continue
             suggested = None
-            if tid is not None and score >= cfg.face_suggest_threshold:
+            if tid is not None and score >= self._thr("face_suggest_threshold"):
                 suggested = {"kind": kind, "id": tid, "name": tname,
                              "score": round(score, 3)}
             face_box, no_face = self._face_box_for(gid, thumb, box_raw, emb)
@@ -605,6 +770,23 @@ class Gallery:
                 conn.close()
         return (box or None), box == []
 
+    def recheck(self, emb: List[float]) -> Optional[Identity]:
+        """Side-effect-free household re-verification for a track's CACHED label.
+        The camera worker resolves a face once per track and caches it — but the
+        tracker can swap two tracks' ids when people cross paths, leaving each person
+        wearing the other's label until the tracks die. Called periodically per live
+        household-labelled track: returns the Identity a fresh embedding decisively
+        matches (same match+margin gate as resolve), or None when the frame is not
+        decisive (bad angle/blur — keep the cached label; NEVER clusters a guest,
+        never reinforces, so a poor re-check frame can't disturb the gallery)."""
+        match_thr = self._thr("face_match_threshold")
+        uid, name, score, margin = self._best_household(emb)
+        if (uid is not None and score >= match_thr
+                and margin >= self._thr("face_match_margin")):
+            return Identity(id=uid, name=name, cls="household",
+                            confidence=_confidence(score, match_thr))
+        return None
+
     # ── the resolver the pipeline calls per new/unmatched track ──────────────
     def resolve(self, emb: List[float], thumb: Optional[bytes] = None,
                 thumb_box: Optional[List[float]] = None) -> Identity:
@@ -614,14 +796,21 @@ class Gallery:
         face crop) is stored so the dashboard can show their face (`thumb_box` = the
         face's normalized position within it). This is the one call the camera worker
         makes once per new/unmatched track (§4.1)."""
+        match_thr = self._thr("face_match_threshold")
         uid, name, score, margin = self._best_household(emb)
-        if uid is not None and score >= cfg.face_match_threshold:
+        # Margin-gated: a face scoring 0.36-vs-0.34 between two members is AMBIGUOUS,
+        # not a match — without this gate a close call gets labelled (and possibly
+        # reinforced) as whoever happens to edge ahead, which is how two members'
+        # centroids cross-contaminate and swap. Ambiguous faces take the guest path,
+        # where the review ladder sorts them out with a human in the loop.
+        if (uid is not None and score >= match_thr
+                and margin >= self._thr("face_match_margin")):
             # Self-improve on a confident + unambiguous match (gated to prevent drift).
-            if (cfg.face_reinforce and score >= cfg.face_reinforce_threshold
-                    and margin >= cfg.face_reinforce_margin):
+            if (cfg.face_reinforce and score >= self._thr("face_reinforce_threshold")
+                    and margin >= self._thr("face_reinforce_margin")):
                 self._reinforce_household(uid, emb)
             return Identity(id=uid, name=name, cls="household",
-                            confidence=_confidence(score, cfg.face_match_threshold))
+                            confidence=_confidence(score, match_thr))
         gid, gname, sightings = self._cluster_guest(emb, thumb, thumb_box)
         # Self-healing top tier: the merged sighting may have pulled the cluster
         # centroid decisively onto a known identity — a household member OR a named
@@ -633,7 +822,7 @@ class Gallery:
                 hkind, hid, hname, hscore = healed
                 if hkind == "member":
                     return Identity(id=hid, name=hname, cls="household",
-                                    confidence=_confidence(hscore, cfg.face_match_threshold))
+                                    confidence=_confidence(hscore, match_thr))
                 return Identity(id=hid, name=hname, cls="guest",
                                 confidence=min(0.6, 0.3 + 0.05 * sightings))
         # A guest's confidence is modest by design — it's "we've seen this person
