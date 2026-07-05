@@ -42,7 +42,10 @@ def rtsp_copy_args(url: str, seg_out: str, hls_out: str,
     no re-encode → full quality at near-zero CPU) into segmented mp4 + HLS via `tee`. This
     is the dual-stream recording half — detection runs on the cheap substream in camera.py
     (DECISIONS #1). Codec-copy can't pre-roll a ring buffer, so this path is continuous
-    (the gated/pre-roll JPEG-pipe path stays for MJPEG cams / when no record_url is set)."""
+    (the gated/pre-roll JPEG-pipe path stays for MJPEG cams / when no record_url is set).
+    Audio IS recorded: Tapo/Mercusys cams emit pcm_alaw (8kHz mono), which mp4 can't
+    hold by copy, so audio alone is transcoded to AAC — negligible CPU next to the
+    video copy; the `0:a:0?` optional map keeps audio-less cameras working."""
     tee = (
         f"[f=segment:strftime=1:segment_time={segment_seconds}:reset_timestamps=1]{seg_out}"
         f"|[f=hls:hls_time=2:hls_list_size=20:"
@@ -50,7 +53,8 @@ def rtsp_copy_args(url: str, seg_out: str, hls_out: str,
     )
     return ["ffmpeg", "-hide_banner", "-loglevel", "error",
             "-rtsp_transport", transport, "-i", url,
-            "-an", "-c:v", "copy", "-map", "0:v:0",
+            "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "32k",
             "-f", "tee", tee]
 
 

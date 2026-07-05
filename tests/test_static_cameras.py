@@ -106,3 +106,96 @@ def test_fetch_cameras_roster_wins_on_id_collision(monkeypatch):
     # The declared roster camera (kitchen) wins; the static stand-in is dropped.
     assert cams[0].zone == "kitchen"
     assert cams[0].stream_url == "http://10.0.0.2:81/stream"
+
+
+def test_static_camera_adopts_dashboard_zone_from_hub_record(monkeypatch):
+    # The hub knows the camera (we proxy-declared it) but holds no stream block —
+    # the static entry adopts the persisted, dashboard-assigned zone while keeping
+    # its local URLs. This is what makes an IP cam zone-configurable like any device.
+    from app import hub_client
+
+    def fake_get(path, headers=None, timeout=4.0):
+        return [{"id": "mc200", "deviceCategory": "camera", "zone": "sala"}]
+
+    declared = []
+    monkeypatch.setattr(hub_client, "_get", fake_get)
+    monkeypatch.setattr(hub_client, "declare_camera", declared.append)
+    monkeypatch.setattr(hub_client.cfg, "static_cameras",
+                        "mc200@entrance@rtsp://u:p@h:554/stream2 rtsp://u:p@h:554/stream1")
+    cams = fetch_cameras()
+    assert len(cams) == 1
+    c = cams[0]
+    assert c.zone == "sala"  # dashboard zone wins over the .env fallback
+    assert c.stream_url == "rtsp://u:p@h:554/stream2"  # URLs stay local
+    assert c.record_url == "rtsp://u:p@h:554/stream1"
+    assert [d.id for d in declared] == ["mc200"]  # heartbeat re-declare each sync
+
+
+def test_static_camera_env_zone_is_fallback_when_hub_zone_unset(monkeypatch):
+    from app import hub_client
+
+    def fake_get(path, headers=None, timeout=4.0):
+        return [{"id": "mc200", "deviceCategory": "camera"}]  # declared, zone not yet assigned
+
+    monkeypatch.setattr(hub_client, "_get", fake_get)
+    monkeypatch.setattr(hub_client, "declare_camera", lambda cam: None)
+    monkeypatch.setattr(hub_client.cfg, "static_cameras",
+                        "mc200@sala@rtsp://u:p@h:554/stream2")
+    cams = fetch_cameras()
+    assert cams[0].zone == "sala"
+
+
+def test_static_camera_declared_even_before_hub_knows_it(monkeypatch):
+    # First sync: hub has no record yet → still declare (that's what creates the card).
+    from app import hub_client
+
+    declared = []
+    monkeypatch.setattr(hub_client, "_get", lambda *a, **k: [])
+    monkeypatch.setattr(hub_client, "declare_camera", declared.append)
+    monkeypatch.setattr(hub_client.cfg, "static_cameras", "cam1@sala@rtsp://u:p@h/s")
+    cams = fetch_cameras()
+    assert [c.id for c in cams] == ["cam1"]
+    assert [d.id for d in declared] == ["cam1"]
+
+
+def test_static_camera_not_declared_when_hub_down(monkeypatch):
+    from app import hub_client
+
+    def boom(*a, **k):
+        raise OSError("hub down")
+
+    declared = []
+    monkeypatch.setattr(hub_client, "_get", boom)
+    monkeypatch.setattr(hub_client, "declare_camera", declared.append)
+    monkeypatch.setattr(hub_client.cfg, "static_cameras", "cam1@sala@rtsp://u:p@h/s")
+    cams = fetch_cameras()
+    assert [c.id for c in cams] == ["cam1"]  # escape hatch still works
+    assert declared == []  # but no declare attempt into a dead hub
+
+
+def test_fetch_cameras_includes_any_device_with_stream_block(monkeypatch):
+    from app import hub_client
+
+    # A camera-equipped voice satellite declares `stream` under its own category —
+    # eligibility is "declares a pullable stream", not deviceCategory == "camera".
+    def fake_get(path, headers=None, timeout=4.0):
+        return [
+            {"id": "cam1", "deviceCategory": "camera", "ip": "10.0.0.2",
+             "zone": "kitchen", "stream": {"path": "/stream", "port": 81}},
+            {"id": "sat1", "deviceCategory": "voice-satellite", "ip": "10.0.0.9",
+             "zone": "oficina",
+             "stream": {"path": "/stream", "port": 81, "snapshot": "/capture",
+                        "res": "VGA", "fps": 1}},
+            # Camera-less satellite: no stream block → not a vision source.
+            {"id": "sat2", "deviceCategory": "voice-satellite", "ip": "10.0.0.10",
+             "zone": "sala"},
+        ]
+
+    monkeypatch.setattr(hub_client, "_get", fake_get)
+    monkeypatch.setattr(hub_client.cfg, "static_cameras", "")
+    cams = fetch_cameras()
+    assert sorted(c.id for c in cams) == ["cam1", "sat1"]
+    sat = next(c for c in cams if c.id == "sat1")
+    assert sat.stream_url == "http://10.0.0.9:81/stream"
+    assert sat.snapshot_url == "http://10.0.0.9:81/capture"
+    assert sat.zone == "oficina"

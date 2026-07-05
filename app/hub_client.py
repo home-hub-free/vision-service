@@ -4,8 +4,11 @@ The vision-service reads two things from the hub, both with the internal-caller
 `X-Hub-Service-Token` header (CLAUDE.md "Service token"; same pattern the voice box
 uses for /auth/users):
 
-  * `GET /get-devices` → filter `deviceCategory == "camera"` → the camera roster,
-    each carrying the `stream` capability block (§3.3) so we can build the MJPEG URL.
+  * `GET /get-devices` → any device carrying a `stream` capability block (§3.3) →
+    the camera roster (the block is how we build the MJPEG URL). In practice that is
+    `deviceCategory == "camera"` plus camera-equipped voice satellites — the hub's
+    `captureStreamDeclare` stores the block category-agnostically, so eligibility is
+    "declares a stream", not "is a camera".
   * `GET /auth/users` → the person roster (names) so a resolved `users.id` gets a
     display name in the identity envelope.
 
@@ -125,22 +128,64 @@ def parse_static_cameras(spec: str) -> List[Camera]:
     return cams
 
 
+def declare_camera(cam: Camera) -> None:
+    """Proxy-declare a static (.env) camera to the hub so it gets a normal device card
+    whose zone is dashboard-assignable like any other device (`/devices-data-set`
+    persists it; the roster carries it back and the supervisor refreshes the worker's
+    zone every poll). Called on every roster sync — heartbeat semantics, exactly like
+    an ESP32-CAM's own declare. The declare carries identity only: RTSP URLs and their
+    credentials never leave this box (.env stays the only secret store) and the hub
+    stays control-plane."""
+    body = json.dumps({"id": cam.id, "name": "camera", "fw_version": "ip-cam"}).encode()
+    req = urllib.request.Request(
+        cfg.hub_url + "/device-declare", data=body,
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=4.0) as resp:
+            resp.read()
+    except (urllib.error.URLError, OSError) as e:
+        print(f"[vision] static camera declare failed for {cam.id}: {e}", flush=True)
+
+
 def fetch_cameras() -> List[Camera]:
     cams: List[Camera] = []
+    raw_by_id: dict = {}
+    hub_ok = False
     try:
         devices = _get("/get-devices", _svc_headers())
-        cams = [Camera(d) for d in devices if d.get("deviceCategory") == "camera"]
+        hub_ok = True
+        # Anything that declared a pullable stream block is a vision source — the
+        # `camera` category proper, plus camera-equipped voice satellites (which
+        # declare as `voice-satellite` but carry the same §3.3 block).
+        raw_by_id = {
+            str(d.get("id")): d
+            for d in devices
+            if d.get("deviceCategory") == "camera" or (d.get("stream") or {}).get("path")
+        }
+        cams = [Camera(d) for d in raw_by_id.values()]
         cams = [c for c in cams if c.stream_url]  # only cams we can actually pull
     except (urllib.error.URLError, OSError, ValueError) as e:
         # A hub outage must not disable the §2 escape hatch — fall through to static.
         print(f"[vision] roster fetch failed: {e}", flush=True)
-    # §2 escape hatch: augment the roster with non-declaring sources (MJPEG-HTTP IP cam/webcam)
-    # for the image-quality go/no-go before firmware exists. Roster wins on id clash.
+    # §2 escape hatch: augment the roster with non-declaring sources (MJPEG-HTTP IP cam/webcam).
+    # Roster wins on id clash when it can actually stream; otherwise the static entry
+    # ADOPTS the hub's device record (zone/name — dashboard-assigned, persisted) while
+    # keeping its local URLs, so an IP camera is zone-configurable like any other device.
+    # The .env zone is only the first-boot / hub-down fallback.
     have = {c.id for c in cams}
     for sc in parse_static_cameras(cfg.static_cameras):
-        if sc.id not in have:
-            cams.append(sc)
-            have.add(sc.id)
+        if sc.id in have:
+            continue
+        raw = raw_by_id.get(sc.id)
+        if raw is not None:
+            merged = {**raw, "zone": raw.get("zone") or sc.zone}
+            sc = Camera(merged,
+                        stream_url_override=sc.stream_url,
+                        record_url_override=sc.record_url)
+        if hub_ok:
+            declare_camera(sc)  # heartbeat: create/refresh the dashboard device card
+        cams.append(sc)
+        have.add(sc.id)
     return cams
 
 

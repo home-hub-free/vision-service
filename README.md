@@ -94,6 +94,15 @@ VISION_STATIC_CAMERAS="patio@garden@rtsp://user:pass@192.168.1.50:554/stream2 rt
 ```
 These augment the roster (the roster wins on an id clash) and survive a hub outage.
 
+**Zone is dashboard-assigned, not .env-baked.** Each static camera is proxy-declared to
+the hub on every roster sync (`hub_client.declare_camera` — heartbeat semantics, like an
+ESP32-CAM's own declare), so it gets a normal device card whose zone is set/changed in
+the dashboard like any other device and persists in the hub DB. The roster zone then
+wins over the static entry's zone on every poll; the `@zone@` in the spec is only the
+first-boot / hub-down fallback. RTSP URLs + credentials never leave this box — the
+declare carries identity only, and `.env` stays the single secret store. Moving a
+camera to another room is a dashboard dropdown change, no redeploy.
+
 **B — a real declare (exercises the hub path too).** Hand-build the `stream` block:
 ```bash
 curl -sX POST http://127.0.0.1:8088/device-declare -H 'Content-Type: application/json' -d '{

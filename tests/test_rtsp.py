@@ -38,6 +38,10 @@ def test_rtsp_copy_args_is_codec_copy_no_reencode():
     assert args[0] == "ffmpeg"
     # codec-copy = full quality, no decode/re-encode (the dual-stream recording win)
     assert "-c:v" in args and "copy" in args
+    # audio recorded as AAC (pcm_alaw can't live in mp4 by copy); optional map so
+    # audio-less cameras still record
+    assert "-an" not in args
+    assert "0:a:0?" in args and "-c:a" in args and "aac" in args
     assert "-rtsp_transport" in args and "tcp" in args
     assert "rtsp://u:p@h:554/stream1" in args
     # both archive (segment) + playback (hls) sinks via a single tee
