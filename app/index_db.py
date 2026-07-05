@@ -141,6 +141,52 @@ class EventIndex:
         finally:
             conn.close()
 
+    def segments_between(self, cam_id: str, start_ts: float, end_ts: float) -> List[dict]:
+        """Every archived segment for a camera overlapping [start_ts, end_ts] — the
+        footage-review list (§9.5). A segment overlaps the window when it starts before
+        the window ends and ends after the window starts (an open/still-recording segment
+        has end_ts NULL → treat it as ongoing = overlaps). `duration` is None while open."""
+        conn = self._db()
+        try:
+            rows = conn.execute(
+                """SELECT id, start_ts, end_ts, file FROM segments
+                   WHERE cam_id=? AND start_ts <= ?
+                     AND (end_ts IS NULL OR end_ts >= ?)
+                   ORDER BY start_ts ASC""",
+                (cam_id, end_ts, start_ts),
+            ).fetchall()
+            return [{"id": r[0], "start": r[1], "end": r[2], "file": r[3],
+                     "duration": (r[2] - r[1]) if r[2] is not None else None} for r in rows]
+        finally:
+            conn.close()
+
+    def recording_days(self, cam_id: str) -> List[str]:
+        """Distinct LOCAL days (YYYY-MM-DD) that have footage for a camera, newest first —
+        the day picker. Grouped in SQLite on the segment start (localtime) so the list is
+        cheap even with weeks of 5-min segments."""
+        conn = self._db()
+        try:
+            rows = conn.execute(
+                """SELECT DISTINCT date(start_ts, 'unixepoch', 'localtime') AS day
+                   FROM segments WHERE cam_id=? ORDER BY day DESC""",
+                (cam_id,),
+            ).fetchall()
+            return [r[0] for r in rows if r[0]]
+        finally:
+            conn.close()
+
+    def segment_by_id(self, seg_id: int) -> Optional[dict]:
+        """Resolve a segment id → its row (for the clip route). Returns None if pruned."""
+        conn = self._db()
+        try:
+            r = conn.execute(
+                "SELECT id, cam_id, start_ts, end_ts, file FROM segments WHERE id=?",
+                (seg_id,),
+            ).fetchone()
+            return {"id": r[0], "cam_id": r[1], "start": r[2], "end": r[3], "file": r[4]} if r else None
+        finally:
+            conn.close()
+
     def segment_at(self, cam_id: str, ts: float) -> Optional[dict]:
         conn = self._db()
         try:

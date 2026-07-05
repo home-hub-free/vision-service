@@ -38,6 +38,23 @@ def _worker_with_fast_source():
                                 "stream": {"port": 81, "path": "/s"}}))
 
 
+def test_records_only_when_rtsp_main_present():
+    """Record scope: a camera archives footage ONLY when it declares a full-quality
+    RTSP main stream (record_url). A face-ID cam (MJPEG only, no record_url) gets a
+    hard-off recorder — no gated JPEG-pipe recording on a desk/entrance sensor."""
+    face_id = CameraWorker(Camera({"id": "desk", "zone": "z", "ip": "1.2.3.4",
+                                   "stream": {"port": 81, "path": "/s"}}))
+    assert face_id.recorder.mode == "off"
+    assert face_id.status()["records"] is False
+
+    ip_cam = CameraWorker(Camera(
+        {"id": "mc200", "zone": "sala", "ip": "1.2.3.5"},
+        stream_url_override="rtsp://h/stream2",
+        record_url_override="rtsp://h/stream1"))
+    assert ip_cam.recorder.mode != "off"   # passthrough → continuous
+    assert ip_cam.status()["records"] is True
+
+
 def test_reader_not_blocked_by_stuck_pipeline():
     orig_open, orig_iter = cam_mod.open_stream, cam_mod.iter_jpeg_frames
     w = _worker_with_fast_source()

@@ -128,6 +128,12 @@ class Config:
     detect_fps: float = field(default_factory=lambda: _f("VISION_DETECT_FPS", 5.0))  # §11.1 GPU lever
     person_conf: float = field(default_factory=lambda: _f("VISION_PERSON_CONF", 0.4))
     face_match_threshold: float = field(default_factory=lambda: _f("VISION_FACE_THRESHOLD", 0.35))
+    # A live match must also BEAT the 2nd-best member by this margin — a 0.36-vs-0.34
+    # face is ambiguous, not a match (ambiguity is how members cross-contaminate).
+    face_match_margin: float = field(default_factory=lambda: _f("VISION_FACE_MATCH_MARGIN", 0.05))
+    # Re-verify a track's cached household label every N seconds (0 disables): heals
+    # tracker id-switches (two people cross → their labels swap and stick otherwise).
+    face_reverify_s: float = field(default_factory=lambda: _f("VISION_FACE_REVERIFY_S", 20.0))
 
     # ── SCRFD face-detector sizing (the far/small-face levers) ────────────────
     # `det_size` is the square SCRFD works at: 640 (the insightface default) throws away
@@ -196,7 +202,7 @@ class Config:
 
     # ── retention janitor (§9.3 — mandatory; never wedge the disk) ───────────
     # DECISION (§9.6/§11.4): exact numbers from a MEASURED day. Defaults are placeholders.
-    retention_days: int = field(default_factory=lambda: _i("VISION_RETENTION_DAYS", 14))
+    retention_days: int = field(default_factory=lambda: _i("VISION_RETENTION_DAYS", 5))
     disk_cap_gb: float = field(default_factory=lambda: _f("VISION_DISK_CAP_GB", 0.0))  # 0 = no cap (age-only)
     janitor_interval_s: float = field(default_factory=lambda: _f("VISION_JANITOR_INTERVAL_S", 600.0))
 

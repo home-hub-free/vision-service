@@ -12,8 +12,8 @@ re-architecture.
 | 2 | **ROCm runtime** — torch-ROCm vs onnxruntime-ROCm (§11.2) | CPU/null (`VISION_DEVICE=cpu`) | `app/perception.py` `_UltralyticsDetector.device`, `_InsightFaceEngine` providers; `requirements.txt` | Spike both; set `VISION_DEVICE=cuda` and/or `VISION_ORT_PROVIDERS=ROCMExecutionProvider`. Face stages run fine on CPU as a fallback. |
 | 3 | **ESP32-CAM image quality for ID** — M2 go/no-go (§11.3) | **escape hatch shipped, verdict OPEN** (presence works regardless) | `VISION_STATIC_CAMERAS` env (`hub_client.parse_static_cameras`) — pull any MJPEG-HTTP **or RTSP** source with NO firmware (reader auto-selects by scheme, `app/rtsp.py`); dual-stream via a 2nd record URL | **[HUMAN/HW]** Run the §2 spike (see README "Validation spike") against a known-good cam, stand at room distance, record GO/NO-GO below. If OV2640 ID is poor → point the roster (or a static entry) at a higher-res IP cam (1080p): both **MJPEG-HTTP** and **RTSP/H.264** are config-only now (RTSP wired in `app/rtsp.py`); use the dual-stream form for ID rooms (detect on substream, record main by codec-copy). |
 | 4 | **Recording encode** — CPU libx264 vs GPU VAAPI/AMF (§9.1/§11.4) | `VISION_REC_ENCODER=libx264` | `app/recorder.py` `_encode_args` | Measure CPU under load; set `VISION_REC_ENCODER=vaapi` (or `amf`) if it saturates AND doesn't starve the vision/LLM GPU. |
-| 5 | **Retention numbers / disk cap** (§9.3/§11.4) | `VISION_RETENTION_DAYS=14`, `VISION_DISK_CAP_GB=0` (age-only) | `app/config.py` + `app/retention.py` | Measure one real day/camera; set days + cap from the measured GB. |
-| 6 | **At-rest encryption** of recordings (§9.3/§11.4) | off (playback gated behind dashboard auth) | `app/recorder.py` output path | Decide if raw video at rest needs encryption; if so, encrypt the `recordings/` volume. |
+| 5 | **Retention numbers / disk cap** (§9.3/§11.4) | **RESOLVED 2026-07-04: `VISION_RETENTION_DAYS=5`** (age-only, `DISK_CAP_GB=0`) — user call pending a NAS | `app/config.py` + `app/retention.py` + `.env` | Revisit once a NAS exists; add a disk cap (or point `rec_dir` at the mount) if 5-day volume outgrows the box. |
+| 6 | **At-rest encryption** of recordings (§9.3/§11.4) | off (playback gated: **list = hub bearer `require_user`; clip bytes = signed short-TTL token**, `app/media_token.py`) | `app/recorder.py` output path | Decide if raw video at rest needs encryption; if so, encrypt the `recordings/` volume. |
 | 7 | **Gallery storage** — vision-local vs memory-service (§11.6) | vision-local sqlite (`app/gallery.py`) | `app/gallery.py` db path | Keep biometrics on the box (recommended). Only move if there's a reason; don't put embeddings in the hub. |
 | 8 | **Guest lifecycle** — cluster threshold, TTL, prompt-to-name (§11.7) | `GUEST_CLUSTER_THRESHOLD=0.5`, `GUEST_MIN_SIGHTINGS=3`, `GUEST_TTL_DAYS=30` | `app/config.py` + `app/gallery.py` cluster + `guests` route | Tune on real footage; add a TTL janitor for stale unnamed guests if needed. |
 | 9 | **Enrollment endpoint owner** (§5.3/§11.8) | **vision-service** (`POST /vision/faces/enroll`), hub stays biometrics-free | `app/routes/enroll.py` + dashboard Face-ID control | Confirmed = vision-service. Hub only brokers identity (roster + token). No change needed unless reversed. |
@@ -21,7 +21,25 @@ re-architecture.
 | 11 | **Identity fusion (face × voice)** (§11.10) | **stub** — not yet fused | `app/occupancy.Identity` (shared envelope) + voice resolver (separate repo) | Design the rule: same person seen + heard in one zone → boost confidence / face confirms a low-confidence voiceprint. Both already fill the same `data.user` shape, so fusion is a reconcile step, not new plumbing. |
 | 12 | **Dashboard stream delivery** — MJPEG proxy vs HLS vs WebRTC (§11.5) | **MJPEG proxy** (`/vision/stream/<id>`); HLS also served (`/vision/hls/<id>/live.m3u8`) | `app/routes/streams.py` + `app/main.py` static mount; dashboard tile | Pick per deployment; both are wired. WebRTC is the future low-latency option (most work). |
 | 13 | **Event index → memory-service?** (§9.6/§11.4) | vision-local only (events already reach memory via MQTT) | `app/index_db.EventIndex._to_memory` (empty stub) | If the segment pointer must live in memory-service too, implement the POST in `_to_memory`. |
-| 14 | **Camera zone assignment** — flash-time vs dashboard (§3.3) | dashboard-assigned (recommended; units interchangeable) | hub `/devices-data-set` merges `zone`; roster carries it to the worker | No code change — assign zone in the dashboard after declare. |
+| 14 | **Camera zone assignment** — flash-time vs dashboard (§3.3) | dashboard-assigned (recommended; units interchangeable) — **now covers static/.env IP cams too**: they are proxy-declared to the hub each roster sync (`hub_client.declare_camera`), so their zone is a dashboard dropdown like any device; the `@zone@` in `VISION_STATIC_CAMERAS` is only the first-boot/hub-down fallback | hub `/devices-data-set` merges `zone`; roster carries it to the worker | No code change — assign zone in the dashboard after declare. |
+
+## Footage review + record scope (BUILT 2026-07-04)
+The §9.5 review surface is now built end-to-end (was: recorder + index existed, but no
+way to browse/play archived clips and every camera recorded).
+- **Record scope** = a camera archives footage **iff it declares an RTSP main stream**
+  (`Camera.record_url`). `app/camera.py` builds the IP-cam fleet's recorder (codec-copy
+  continuous) and gives every MJPEG-only cam — the ESP32-CAM entrance cam + the face-ID
+  desk cams on satellites — a hard-off recorder (`mode="off"`). `status().records`
+  surfaces this to the dashboard so only recording cams show a Recordings entry point.
+- **Review routes** (`app/routes/recordings.py`): `GET /recordings/cameras` (recording
+  cams + footage days) and `GET /recordings/{cam}/segments?start=&end=` are
+  `require_user` bearer-gated; each segment carries its event markers +
+  `GET /recordings/{cam}/clip/{seg_id}?token=` (Range-seekable `FileResponse`, path-
+  traversal-guarded, gated by a signed short-TTL token from `app/media_token.py` so a
+  `<video>` element with no Authorization header can still play member-only footage).
+- **Index reads** added: `index_db.segments_between` / `recording_days` / `segment_by_id`.
+- **Dashboard**: Recordings lightbox (day chips → clip list with "who was present" →
+  seekable `<video>`), reached from the camera live view when `records` is true.
 
 ## Firmware (separate `devices/` repo — now BUILT, 2026-06-28)
 The ESP32-CAM firmware (§3) lives in the standalone `devices` repo (`devices/camera`).

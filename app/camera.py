@@ -50,7 +50,15 @@ class CameraWorker(threading.Thread):
         self.detector = make_detector()
         self.face = make_face_engine()
         self.pose = make_pose_engine()  # T1 (§3): null unless VISION_POSE_BACKEND is set
-        self.recorder = Recorder(cam.id, cam.zone, index, record_url=cam.record_url)
+        # Record scope (DECISIONS): a camera records ONLY when it has a full-quality
+        # RTSP MAIN stream (`record_url`) — the IP-cam fleet (Tapo/MC200). MJPEG-only
+        # cams (the ESP32-CAM entrance cam + the face-ID desk cams on satellites) get a
+        # hard-off recorder so we never spend disk archiving a face-ID sensor. `off` is
+        # a no-op for both intake paths (write_frame/on_presence/tick all early-return).
+        records = bool(cam.record_url)
+        self.recorder = Recorder(cam.id, cam.zone, index,
+                                 mode=(cfg.rec_mode_default if records else "off"),
+                                 record_url=cam.record_url)
         # NB: not `_stop` — threading.Thread._stop is an internal METHOD it calls when a
         # thread finishes/joins; shadowing it with an Event breaks join() ("'Event' object
         # is not callable"). Same trap as _ident/_idents above.
@@ -85,6 +93,9 @@ class CameraWorker(threading.Thread):
         # threading.Thread, which uses `self._ident` for the thread id and overwrites it
         # on .start() (an int), breaking len() in _prune_idents. Use `_idents`.
         self._idents: Dict[str, Identity] = {}
+        # per-track last identity-check timestamp (drives the periodic household
+        # re-verify that heals tracker id-switches; pruned alongside _idents).
+        self._ident_ts: Dict[str, float] = {}
         self._last_pipeline = 0.0
         # T0/T1 digest cadence: pose sub-sampling counter (§3 cost-gate lever) and the
         # occupied-zone heartbeat push clock (§2 — activity changes with no salient
@@ -232,26 +243,41 @@ class CameraWorker(threading.Thread):
             ident = self._idents.get(t.track_id)
             # Embed + resolve once per track, then re-try only while still unknown.
             if ident is None or ident.cls == "unknown":
-                # Prefer the face-box-aware path: the stored thumbnail is then a
-                # face-CENTERED crop of exactly the matched face (never a full-body
-                # sliver, never an ambiguous two-person box), and the face's position
-                # within it rides along so the review card can ring it.
-                emb, thumb, thumb_box = None, None, None
-                if hasattr(self.face, "embed_face"):
-                    hit = self.face.embed_face(frame, t.bbox)
-                    if hit is not None:
-                        emb, fbox = hit
-                        packed = face_crop_jpeg(frame, fbox)
-                        if packed is not None:
-                            thumb, thumb_box = packed
-                else:  # engines without the face-box API — old person-crop behavior
-                    emb = self.face.embed(frame, t.bbox)
+                emb, thumb, thumb_box = self._embed_track(frame, t.bbox)
                 if emb is not None:
-                    ident = gallery.resolve(emb, thumb or crop_jpeg(frame, t.bbox),
-                                            thumb_box=thumb_box)
+                    try:
+                        ident = gallery.resolve(emb, thumb or crop_jpeg(frame, t.bbox),
+                                                thumb_box=thumb_box)
+                    except Exception as e:  # noqa: BLE001 — a gallery failure on ONE face
+                        # must not abort the frame (it would also drop occupancy, edges
+                        # and every other track — a DB hiccup blinded whole frames once).
+                        print(f"[vision] cam {self.cam.id} resolve error: {e!r}", flush=True)
+                        ident = ident or UNKNOWN
                 else:
                     ident = ident or UNKNOWN
                 self._idents[t.track_id] = ident
+                self._ident_ts[t.track_id] = now
+            elif (cfg.face_reverify_s > 0 and ident.cls == "household"
+                  and now - self._ident_ts.get(t.track_id, 0.0) >= cfg.face_reverify_s):
+                # Heal tracker id-switches: when two people cross, ByteTrack can swap
+                # their track ids — each then wears the OTHER's cached label for the
+                # track's whole life. Periodically re-embed and, only on a decisive
+                # fresh match (recheck is side-effect-free and margin-gated), replace
+                # the cached identity. An indecisive frame keeps the cached label.
+                self._ident_ts[t.track_id] = now  # pace re-checks even when indecisive
+                emb, _, _ = self._embed_track(frame, t.bbox)
+                fresh = None
+                if emb is not None:
+                    try:
+                        fresh = gallery.recheck(emb)
+                    except Exception as e:  # noqa: BLE001 — same posture as resolve
+                        print(f"[vision] cam {self.cam.id} recheck error: {e!r}", flush=True)
+                if fresh is not None and fresh.id != ident.id:
+                    print(f"[vision] cam {self.cam.id} track {t.track_id} relabelled "
+                          f"{ident.name or ident.id} -> {fresh.name or fresh.id} "
+                          f"(id-switch heal)", flush=True)
+                    ident = fresh
+                    self._idents[t.track_id] = fresh
             observations.append(Observation(track_id=t.track_id, identity=ident,
                                             bbox=t.bbox, frame_w=frame_w,
                                             posture=postures.get(t.track_id)))
@@ -297,9 +323,28 @@ class CameraWorker(threading.Thread):
             return True
         return self.motion_active or (now - self.last_motion_ts) < cfg.motion_linger_s
 
+    def _embed_track(self, frame, bbox):
+        """(embedding, thumb, thumb_box) for one track's person box.
+        Prefer the face-box-aware path: the thumbnail is then a face-CENTERED crop of
+        exactly the matched face (never a full-body sliver, never an ambiguous
+        two-person box), and the face's position within it rides along so the review
+        card can ring it. All three are None-able (no face found / engine w/o API)."""
+        emb, thumb, thumb_box = None, None, None
+        if hasattr(self.face, "embed_face"):
+            hit = self.face.embed_face(frame, bbox)
+            if hit is not None:
+                emb, fbox = hit
+                packed = face_crop_jpeg(frame, fbox)
+                if packed is not None:
+                    thumb, thumb_box = packed
+        else:  # engines without the face-box API — old person-crop behavior
+            emb = self.face.embed(frame, bbox)
+        return emb, thumb, thumb_box
+
     def _prune_idents(self, live: set) -> None:
         if len(self._idents) > 256:
             self._idents = {k: v for k, v in self._idents.items() if k in live}
+            self._ident_ts = {k: v for k, v in self._ident_ts.items() if k in live}
 
     # ── dashboard re-serve (§3.2 — we are the ONLY client of the cam) ─────────
     def mjpeg_generator(self, annotated: bool = True):
@@ -327,6 +372,7 @@ class CameraWorker(threading.Thread):
             "detector": self.detector.backend, "face": self.face.backend,
             "pose": self.pose.backend,
             "rec_mode": self.recorder.mode,
+            "records": self.recorder.mode != "off",
             "onvif": caps,
             "events_attached": self.events_attached,
             "motion_active": self.motion_active if self.events_attached else None,

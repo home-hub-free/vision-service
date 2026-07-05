@@ -21,7 +21,7 @@ from .config import cfg
 from .ingest import init_ingestion
 from .perception import annotate_face_in_thumb
 from .retention import Janitor
-from .routes import camctl, enroll, guests, imaging, occupancy, ptz, streams
+from .routes import camctl, enroll, guests, imaging, occupancy, ptz, recordings, streams
 from .state import gallery, index
 from .supervisor import Supervisor
 
@@ -59,6 +59,8 @@ app.add_middleware(
 
 app.include_router(streams.router)
 app.include_router(occupancy.router)
+# Footage review (§9.5): list + play back the archived recordings (IP cams only).
+app.include_router(recordings.router)
 app.include_router(enroll.router)
 app.include_router(guests.router)
 # ONVIF control seam (CAMERA_ONVIF_CONTROL_PLAN): PTZ + imaging + per-camera summary.
