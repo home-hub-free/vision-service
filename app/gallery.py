@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -62,6 +63,10 @@ class Gallery:
         # box within the thumb, [] for "no face found", None for "engine unavailable".
         # Used to lazily locate the face in LEGACY person-crop thumbs at review time.
         self.thumb_annotator = None
+        # Capture-ledger folder: alongside THIS gallery's DB unless overridden, so a
+        # temp-DB gallery (tests) never writes crops into the production data dir.
+        self.captures_dir = cfg.captures_dir or os.path.join(
+            os.path.dirname(self.db_path), "captures")
         self._init()
 
     def _db(self) -> sqlite3.Connection:
@@ -106,6 +111,23 @@ class Gallery:
             # the household can tune from Settings without a redeploy. See `thresholds()`.
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            # Capture ledger — the permanent archive behind every identity decision
+            # (see `_capture`): the crop lands on disk under captures_dir, this row
+            # indexes it WITH the exact embedding so a member profile can be rebuilt
+            # from curated crops without re-running the face engine.
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS captures (
+                       id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                       ts          TEXT NOT NULL DEFAULT (datetime('now')),
+                       kind        TEXT NOT NULL,
+                       resolved_id TEXT,
+                       cluster_id  TEXT,
+                       score       REAL,
+                       reinforced  INTEGER NOT NULL DEFAULT 0,
+                       embedding   TEXT NOT NULL,
+                       path        TEXT,
+                       thumb_box   TEXT)"""
+            )
             conn.commit()
         finally:
             conn.close()
@@ -197,6 +219,7 @@ class Gallery:
     def enroll(self, user_id: str, name: Optional[str], emb: List[float],
                thumb: Optional[bytes] = None) -> int:
         emb = _normalise(emb)
+        self._capture("enroll", emb, thumb, resolved_id=user_id)
         with _lock:
             conn = self._db()
             try:
@@ -220,6 +243,100 @@ class Gallery:
                 return samples
             finally:
                 conn.close()
+
+    # ── capture ledger (identity-pollution insurance) ─────────────────────────
+    def _capture(self, kind: str, emb: List[float], thumb: Optional[bytes],
+                 thumb_box: Optional[List[float]] = None,
+                 resolved_id: Optional[str] = None, cluster_id: Optional[str] = None,
+                 score: Optional[float] = None, reinforced: bool = False) -> None:
+        """Permanently archive the face crop + embedding behind an identity decision.
+
+        The member/cluster centroids are running means — once an embedding is folded
+        in, its individual contribution is unrecoverable (reinforce folds especially:
+        the per-frame embedding used to be discarded on the spot). This ledger keeps
+        the raw INGREDIENTS instead: the crop as a plain JPEG on disk (grouped per
+        resolved identity, so a human can review a folder of faces), and an index row
+        carrying the EXACT embedding — so any member profile can be rebuilt from a
+        curated set (tools/rebuild_profile.py) without re-running the face engine.
+        Best-effort by design: never throws into resolve/enroll; only sightings that
+        carry a crop are recorded (an embedding nobody can review can't be curated)."""
+        if not cfg.captures_enabled or thumb is None:
+            return
+        try:
+            owner = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(resolved_id or cluster_id or "unknown"))
+            d = os.path.join(self.captures_dir, owner)
+            os.makedirs(d, exist_ok=True)
+            fname = f"{time.time_ns()}_{kind}.jpg"
+            with open(os.path.join(d, fname), "wb") as fh:
+                fh.write(thumb)
+            with _lock:
+                conn = self._db()
+                try:
+                    conn.execute(
+                        """INSERT INTO captures (kind, resolved_id, cluster_id, score,
+                                                 reinforced, embedding, path, thumb_box)
+                           VALUES (?,?,?,?,?,?,?,?)""",
+                        (kind, resolved_id, cluster_id,
+                         round(float(score), 4) if score is not None else None,
+                         1 if reinforced else 0, json.dumps(_normalise(emb)),
+                         os.path.join(owner, fname),
+                         json.dumps(thumb_box) if thumb_box is not None else None))
+                    conn.commit()
+                finally:
+                    conn.close()
+        except Exception as e:  # noqa: BLE001 — the ledger must never break recognition
+            print(f"[vision] capture ledger write failed: {e!r}", flush=True)
+
+    def captures(self, resolved_id: Optional[str] = None) -> List[dict]:
+        """Ledger rows (newest first), optionally for one identity — the review/audit
+        read used by tools/rebuild_profile.py."""
+        conn = self._db()
+        try:
+            q = ("SELECT id, ts, kind, resolved_id, cluster_id, score, reinforced, path "
+                 "FROM captures")
+            args: tuple = ()
+            if resolved_id is not None:
+                q += " WHERE resolved_id=?"
+                args = (resolved_id,)
+            rows = conn.execute(q + " ORDER BY id DESC", args).fetchall()
+        finally:
+            conn.close()
+        return [{"id": r[0], "ts": r[1], "kind": r[2], "resolved_id": r[3],
+                 "cluster_id": r[4], "score": r[5], "reinforced": bool(r[6]),
+                 "path": r[7]} for r in rows]
+
+    def rebuild_member(self, user_id: str, embs: List[List[float]],
+                       name: Optional[str] = None, thumb: Optional[bytes] = None) -> int:
+        """Re-make the soup: REPLACE a member's centroid with the plain mean of a
+        curated embedding set (same ingredients, less salt). Unlike `enroll`, which
+        running-means new samples into whatever is already in the pot (a seasoned —
+        possibly polluted — centroid barely moves), this discards the old centroid
+        entirely. name/thumb are kept from the existing row unless supplied. Returns
+        the new samples count (= len(embs))."""
+        if not embs:
+            raise ValueError("no embeddings to rebuild from")
+        vecs = [_normalise(e) for e in embs]
+        dim = len(vecs[0])
+        merged = _normalise([sum(v[i] for v in vecs) / len(vecs) for i in range(dim)])
+        with _lock:
+            conn = self._db()
+            try:
+                row = conn.execute("SELECT name, thumb FROM faces WHERE user_id=?",
+                                   (user_id,)).fetchone()
+                keep_name = name if name is not None else (row[0] if row else None)
+                keep_thumb = thumb if thumb is not None else (row[1] if row else None)
+                conn.execute(
+                    """INSERT INTO faces (user_id, name, embedding, samples, thumb, updated_at)
+                       VALUES (?,?,?,?,?,datetime('now'))
+                       ON CONFLICT(user_id) DO UPDATE SET
+                         name=excluded.name, embedding=excluded.embedding,
+                         samples=excluded.samples, thumb=excluded.thumb,
+                         updated_at=excluded.updated_at""",
+                    (user_id, keep_name, json.dumps(merged), len(vecs), keep_thumb))
+                conn.commit()
+            finally:
+                conn.close()
+        return len(vecs)
 
     def forget(self, user_id: str) -> None:
         with _lock:
@@ -812,9 +929,13 @@ class Gallery:
         if (uid is not None and score >= match_thr
                 and margin >= self._thr("face_match_margin")):
             # Self-improve on a confident + unambiguous match (gated to prevent drift).
-            if (cfg.face_reinforce and score >= self._thr("face_reinforce_threshold")
-                    and margin >= self._thr("face_reinforce_margin")):
+            reinforced = (cfg.face_reinforce
+                          and score >= self._thr("face_reinforce_threshold")
+                          and margin >= self._thr("face_reinforce_margin"))
+            if reinforced:
                 self._reinforce_household(uid, emb)
+            self._capture("match", emb, thumb, thumb_box, resolved_id=uid,
+                          score=score, reinforced=reinforced)
             return Identity(id=uid, name=name, cls="household",
                             confidence=_confidence(score, match_thr))
         gid, gname, sightings, promoted, cscore = self._cluster_guest(emb, thumb, thumb_box)
@@ -849,12 +970,18 @@ class Gallery:
                 # Answer as an anonymous guest sighting — "someone is here", no name —
                 # instead of asserting a 50/50 identity. The 20s re-verify upgrades the
                 # label as soon as a frame reads decisively.
+                self._capture("ambiguous", emb, thumb, thumb_box, cluster_id=gid,
+                              score=cscore)
                 return Identity(id=gid, name=None, cls="guest",
                                 confidence=min(0.6, 0.3 + 0.05 * sightings))
-            if (cfg.face_reinforce and cscore >= self._thr("face_reinforce_threshold")
-                    and (own is None or o_uid is None
-                         or own - o_score >= self._thr("face_reinforce_margin"))):
+            reinforced = (cfg.face_reinforce
+                          and cscore >= self._thr("face_reinforce_threshold")
+                          and (own is None or o_uid is None
+                               or own - o_score >= self._thr("face_reinforce_margin")))
+            if reinforced:
                 self._reinforce_household(promoted, emb)
+            self._capture("promoted", emb, thumb, thumb_box, resolved_id=promoted,
+                          cluster_id=gid, score=cscore, reinforced=reinforced)
             return Identity(id=promoted, name=gname, cls="household",
                             confidence=_confidence(cscore, self._thr("guest_cluster_threshold")))
         # Self-healing top tier: the merged sighting may have pulled the cluster
@@ -865,6 +992,8 @@ class Gallery:
             healed = self._maybe_autoheal(gid)
             if healed:
                 hkind, hid, hname, hscore = healed
+                self._capture("healed", emb, thumb, thumb_box, resolved_id=hid,
+                              cluster_id=gid, score=hscore)
                 if hkind == "member":
                     return Identity(id=hid, name=hname, cls="household",
                                     confidence=_confidence(hscore, match_thr))
@@ -872,5 +1001,7 @@ class Gallery:
                                 confidence=min(0.6, 0.3 + 0.05 * sightings))
         # A guest's confidence is modest by design — it's "we've seen this person
         # before", not "this is verified David". The agent stays polite/cautious.
+        self._capture("cluster", emb, thumb, thumb_box, resolved_id=gid,
+                      cluster_id=gid, score=cscore)
         return Identity(id=gid, name=gname, cls="guest",
                         confidence=min(0.6, 0.3 + 0.05 * sightings))

@@ -233,6 +233,18 @@ class Config:
     guest_min_sightings: int = field(default_factory=lambda: _i("VISION_GUEST_MIN_SIGHTINGS", 3))  # surface to review
     guest_ttl_days: int = field(default_factory=lambda: _i("VISION_GUEST_TTL_DAYS", 30))
 
+    # ── capture ledger (identity-pollution insurance) ─────────────────────────
+    # The gallery centroids are running means: once an embedding is folded into a
+    # member it can never be exactly recovered (reinforce folds especially). This
+    # ledger permanently archives every face crop + embedding behind an identity
+    # decision — plain JPEGs on disk grouped per identity, indexed (with the exact
+    # embedding) in the gallery DB — so the household can always review the raw
+    # ingredients and REBUILD any member's profile from curated ones
+    # (tools/rebuild_profile.py). No retention on purpose (crops are ~10 KB; a busy
+    # week is a few MB). Dir default "" = a `captures/` folder next to the gallery DB.
+    captures_enabled: bool = field(default_factory=lambda: _b("VISION_CAPTURES_ENABLED", True))
+    captures_dir: str = field(default_factory=lambda: os.getenv("VISION_CAPTURES_DIR", ""))
+
     # ── review tiers (self-healing gallery — how a guest cluster resolves) ───
     # Each unpromoted cluster is scored against the household centroids and lands in
     # one of three tiers:
