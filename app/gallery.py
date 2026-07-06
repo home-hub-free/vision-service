@@ -305,6 +305,57 @@ class Gallery:
                  "cluster_id": r[4], "score": r[5], "reinforced": bool(r[6]),
                  "path": r[7]} for r in rows]
 
+    def capture_image(self, capture_id: int) -> Optional[bytes]:
+        """The archived crop JPEG for one ledger row, or None (no crop / file gone)."""
+        conn = self._db()
+        try:
+            row = conn.execute("SELECT path FROM captures WHERE id=?", (capture_id,)).fetchone()
+        finally:
+            conn.close()
+        if not row or not row[0]:
+            return None
+        try:
+            with open(os.path.join(self.captures_dir, row[0]), "rb") as fh:
+                return fh.read()
+        except OSError:
+            return None
+
+    def delete_capture(self, capture_id: int) -> bool:
+        """Remove one ingredient from the ledger — row AND crop file — so a manual
+        clean of a polluted set sticks: a later rebuild uses only what remains."""
+        with _lock:
+            conn = self._db()
+            try:
+                row = conn.execute("SELECT path FROM captures WHERE id=?", (capture_id,)).fetchone()
+                if not row:
+                    return False
+                conn.execute("DELETE FROM captures WHERE id=?", (capture_id,))
+                conn.commit()
+            finally:
+                conn.close()
+        if row[0]:
+            try:
+                os.remove(os.path.join(self.captures_dir, row[0]))
+            except OSError:
+                pass  # file already gone — the row was the source of truth
+        return True
+
+    def rebuild_member_from_captures(self, user_id: str,
+                                     name: Optional[str] = None) -> Optional[int]:
+        """Re-make a member's soup from the ledger: REPLACE their centroid with the
+        plain mean of every remaining capture archived for them (the dashboard's
+        "rebuild profile" — delete the polluted photos first, then call this).
+        Returns the new samples count, or None when no captures exist to build from."""
+        conn = self._db()
+        try:
+            rows = conn.execute("SELECT embedding FROM captures WHERE resolved_id=?",
+                                (user_id,)).fetchall()
+        finally:
+            conn.close()
+        if not rows:
+            return None
+        return self.rebuild_member(user_id, [json.loads(r[0]) for r in rows], name=name)
+
     def rebuild_member(self, user_id: str, embs: List[List[float]],
                        name: Optional[str] = None, thumb: Optional[bytes] = None) -> int:
         """Re-make the soup: REPLACE a member's centroid with the plain mean of a

@@ -72,6 +72,58 @@ def detach_cluster(guest_id: str, authorization=Header(None)):
     return {"ok": True, "guest_id": guest_id, "detached_from": member}
 
 
+@router.get("/faces/{owner}/captures")
+def list_captures(owner: str, limit: int = 200):
+    """The capture ledger for one identity — every archived crop behind their
+    recognition decisions (the "soup ingredients"). Newest first; the dashboard's
+    photo-collection view renders these with delete controls so a polluted set can
+    be cleaned by hand before a rebuild."""
+    rows = gallery.captures(owner)
+    total = len(rows)
+    out = []
+    for r in rows[:max(1, min(limit, 1000))]:
+        out.append({"id": r["id"], "ts": r["ts"], "kind": r["kind"],
+                    "score": r["score"], "reinforced": r["reinforced"],
+                    "image": f"faces/captures/{r['id']}/image" if r["path"] else None})
+    return {"owner": owner, "total": total, "captures": out}
+
+
+@router.get("/faces/captures/{capture_id}/image")
+def capture_image(capture_id: int):
+    data = gallery.capture_image(capture_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="no image for this capture")
+    # Immutable by id — let the browser cache the grid instead of re-pulling crops.
+    return Response(content=data, media_type="image/jpeg",
+                    headers={"Cache-Control": "private, max-age=86400"})
+
+
+@router.delete("/faces/captures/{capture_id}")
+def delete_capture(capture_id: int, authorization=Header(None)):
+    """Remove one photo (row + file) from an identity's ingredient set — the manual
+    clean before a rebuild. Deleting never touches the live centroid by itself."""
+    require_user(authorization)  # admin-gated
+    if not gallery.delete_capture(capture_id):
+        raise HTTPException(status_code=404, detail="capture not found")
+    return {"ok": True, "id": capture_id}
+
+
+@router.post("/faces/{user_id}/rebuild")
+def rebuild_member(user_id: str, name: Optional[str] = Body(None, embed=True),
+                   authorization=Header(None)):
+    """Re-do the soup: REPLACE the member's face centroid with the plain mean of
+    every capture still archived for them. Delete the wrong photos first — the
+    rebuild uses exactly what remains. Same whole-household trust as the review
+    flow (any member can fix any profile)."""
+    require_user(authorization)  # admin-gated
+    samples = gallery.rebuild_member_from_captures(user_id, name=name)
+    if samples is None:
+        raise HTTPException(status_code=409,
+                            detail="no captures archived for this member yet — "
+                                   "nothing to rebuild from")
+    return {"ok": True, "user_id": user_id, "samples": samples}
+
+
 @router.get("/faces/thumb/{label_id}")
 def thumb(label_id: str):
     """The stored face image for a label (`users.id` member or `guest:N` cluster) — the
