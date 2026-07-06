@@ -53,6 +53,29 @@ def test_promote_guest_seeds_household_gallery():
     assert ident.cls == "household" and ident.id == "u9" and ident.name == "Sam"
 
 
+def test_promoted_cluster_match_answers_as_household_member():
+    """The david-as-guest bug: a live embedding that FAILS the strict household gate
+    (far/angled camera) but still matches a PROMOTED cluster must answer as the member
+    (cls household, their id), not as a guest — and reinforce the member's gallery so
+    the household centroid converges on what that camera actually sees."""
+    cfg.face_match_threshold = 0.99   # household gate the drifted vector can't clear
+    cfg.guest_cluster_threshold = 0.9
+    cfg.face_reinforce = True
+    cfg.face_reinforce_threshold = 0.9
+    g = _g()
+    v = _vec(3.0)
+    g.resolve(v)  # creates guest:1
+    assert g.promote_guest("guest:1", "u9", "Sam")
+    drifted = _vec(3.0)
+    drifted[4] = 0.33  # cosine ~0.95 to v: fails 0.99 household gate, clears 0.9 cluster
+    before = g._best_household(drifted)[2]
+    ident = g.resolve(drifted)
+    assert ident.cls == "household" and ident.id == "u9" and ident.name == "Sam"
+    assert ident.confidence >= 0.6  # passes the agent's naming gate
+    # the member's gallery centroid moved toward the drifted look (reinforcement)
+    assert g._best_household(drifted)[2] > before
+
+
 def test_forget_removes_profile():
     g = _g()
     g.enroll("u1", "David", _vec(1.0))

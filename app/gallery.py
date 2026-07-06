@@ -328,12 +328,17 @@ class Gallery:
 
     # ── guest clustering (§4.3 / §11.7) ───────────────────────────────────────
     def _cluster_guest(self, emb: List[float], thumb: Optional[bytes] = None,
-                       thumb_box: Optional[List[float]] = None) -> Tuple[str, Optional[str], int]:
-        """Online cluster an unknown embedding. Returns (guest_id, name, sightings).
-        Stores the captured face crop on cluster creation (and backfills it later if the
-        first sighting had no crop) so the dashboard can show every person's face.
-        `thumb_box` is the face's normalized position within that crop — it always
-        travels WITH the thumb (only written when this call's thumb is the one kept)."""
+                       thumb_box: Optional[List[float]] = None
+                       ) -> Tuple[str, Optional[str], int, Optional[str], float]:
+        """Online cluster an unknown embedding. Returns (guest_id, name, sightings,
+        promoted_user_id, match_score) — promoted_user_id is set when the matched
+        cluster was folded into a household member (resolve answers as THEM, not as a
+        guest), and match_score is the cosine against the cluster centroid (-1.0 for a
+        freshly seeded cluster). Stores the captured face crop on cluster creation (and
+        backfills it later if the first sighting had no crop) so the dashboard can show
+        every person's face. `thumb_box` is the face's normalized position within that
+        crop — it always travels WITH the thumb (only written when this call's thumb is
+        the one kept)."""
         box_json = json.dumps(thumb_box) if thumb_box is not None else None
         with _lock:
             conn = self._db()
@@ -369,8 +374,9 @@ class Gallery:
                             (json.dumps(merged), best_n + 1, best_id),
                         )
                     conn.commit()
-                    name = conn.execute("SELECT name FROM guests WHERE guest_id=?", (best_id,)).fetchone()[0]
-                    return best_id, name, best_n + 1
+                    name, promoted = conn.execute(
+                        "SELECT name, promoted_user_id FROM guests WHERE guest_id=?", (best_id,)).fetchone()
+                    return best_id, name, best_n + 1, promoted, best_s
                 # New guest cluster — every distinct person gets a default id here.
                 # MAX+1, not COUNT+1: after any deletion COUNT falls below the top id
                 # and COUNT+1 collides with an existing row (UNIQUE violation), which
@@ -385,7 +391,7 @@ class Gallery:
                     (gid, None, json.dumps(_normalise(emb)), thumb, box_json if thumb else None),
                 )
                 conn.commit()
-                return gid, None, 1
+                return gid, None, 1, None, -1.0
             finally:
                 conn.close()
 
@@ -811,7 +817,21 @@ class Gallery:
                 self._reinforce_household(uid, emb)
             return Identity(id=uid, name=name, cls="household",
                             confidence=_confidence(score, match_thr))
-        gid, gname, sightings = self._cluster_guest(emb, thumb, thumb_box)
+        gid, gname, sightings, promoted, cscore = self._cluster_guest(emb, thumb, thumb_box)
+        # A PROMOTED cluster answers as the household member it was folded into — the
+        # promotion ("this cluster IS this member", human-confirmed or auto-healed)
+        # outranks the household gallery's strict gate, which a far/angled camera can
+        # fail forever. Without this, the member keeps resolving cls="guest" (confidence
+        # capped 0.6) from that camera, AND the rich-get-richer trap locks it in: the
+        # cluster centroid updates on every sighting while the household centroid only
+        # reinforces on confident household matches. So we also (gated) reinforce the
+        # member's gallery with the live embedding, letting the household centroid
+        # converge on the look this camera actually sees.
+        if promoted is not None:
+            if cfg.face_reinforce and cscore >= self._thr("face_reinforce_threshold"):
+                self._reinforce_household(promoted, emb)
+            return Identity(id=promoted, name=gname, cls="household",
+                            confidence=_confidence(cscore, self._thr("guest_cluster_threshold")))
         # Self-healing top tier: the merged sighting may have pulled the cluster
         # centroid decisively onto a known identity — a household member OR a named
         # guest — fold it in and answer as them instead of a fresh "Person N" (works

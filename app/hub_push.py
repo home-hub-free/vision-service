@@ -22,11 +22,12 @@ hub is down or `VISION_HUB_PUSH_ENABLED` is false. A `room_empty` change pushes
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
-from .actions import activity_hint
+from .actions import Hint, activity_hint
 from .config import cfg
 
 
@@ -64,8 +65,36 @@ def zone_activity(snapshot_people: List[dict]) -> Optional[str]:
     return f"{act}+{posture}" if posture else act
 
 
+# T2a hint hysteresis (per zone): the last fired hint + when it last fired. A hint
+# survives brief rule dropouts (a posture flicker, one `moving` snapshot) for
+# cfg.hint_hold_s while the zone stays occupied; a new fired hint replaces it
+# immediately; an emptied zone clears it.
+_hint_hold: Dict[str, Tuple[Hint, float]] = {}
+
+
+def _held_hint(zone: str, fired: Optional[Hint], occupied: bool,
+               now: float) -> Optional[Hint]:
+    if not occupied:
+        _hint_hold.pop(zone, None)
+        return None
+    if fired is not None:
+        _hint_hold[zone] = (fired, now)
+        return fired
+    held = _hint_hold.get(zone)
+    if held is not None and now - held[1] <= cfg.hint_hold_s:
+        return held[0]
+    _hint_hold.pop(zone, None)
+    return None
+
+
+def _reset_hint_hold() -> None:
+    """Test seam."""
+    _hint_hold.clear()
+
+
 def room_digest_payload(zone: str, snapshot_people: List[dict],
-                        hour: Optional[int] = None) -> dict:
+                        hour: Optional[int] = None,
+                        now: Optional[float] = None) -> dict:
     """Pure builder: a zone's `tracker.snapshot(zone)` people list → the /perception body.
 
     `snapshot_people` is the per-zone list `OccupancyTracker.snapshot()` returns (each entry
@@ -99,8 +128,11 @@ def room_digest_payload(zone: str, snapshot_people: List[dict],
     if activity:
         body["activity"] = activity
     # T2a (plan §4.2a): context-rule hint over the same signals — additive, hedged
-    # downstream ("likely …"/"possibly …"); `hour` is injectable for tests.
-    hint = activity_hint(zone, snapshot_people, hour=hour)
+    # downstream ("likely …"/"possibly …"), held through brief dropouts (hysteresis).
+    # `hour`/`now` are injectable for tests.
+    hint = _held_hint(zone, activity_hint(zone, snapshot_people, hour=hour),
+                      occupied=len(people) > 0,
+                      now=time.time() if now is None else now)
     if hint:
         body["activity_hint"], body["activity_hint_conf"] = hint
     return body

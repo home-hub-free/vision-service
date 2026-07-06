@@ -180,6 +180,10 @@ class Config:
     # office|bedroom|entrance|bathroom). The built-in es/en synonym table covers the
     # common names; this knob exists for zones the table can't guess ("cueva=office").
     zone_kinds: str = field(default_factory=lambda: os.getenv("VISION_ZONE_KINDS", ""))
+    # Hint hysteresis: a fired hint survives brief rule dropouts (a posture flicker, one
+    # `moving` snapshot) for this long while the zone stays occupied. An emptied zone or
+    # a DIFFERENT fired hint clears/replaces it immediately.
+    hint_hold_s: float = field(default_factory=lambda: _f("VISION_HINT_HOLD_S", 30.0))
 
     # ── T1 posture: pose → body state (plan §3 — CPU, motion-gated, cost-gated) ─
     # "null" ships the tier dark; "ultralytics" runs yolov8n-pose on the SAME cadence
@@ -188,6 +192,11 @@ class Config:
     pose_backend: str = field(default_factory=lambda: os.getenv("VISION_POSE_BACKEND", "null"))
     pose_every_n: int = field(default_factory=lambda: _i("VISION_POSE_EVERY_N", 1))
     pose_min_kp_conf: float = field(default_factory=lambda: _f("VISION_POSE_MIN_KP_CONF", 0.3))
+    # Posture debounce: a NEW posture must hold this long before it replaces the
+    # committed one. A partial bbox at frame-exit reads "lying" for a few frames and
+    # would otherwise flap the digest (and drop a T2a hint). The first read commits
+    # immediately (nothing to protect yet).
+    posture_stable_s: float = field(default_factory=lambda: _f("VISION_POSTURE_STABLE_S", 10.0))
     # Fall-shaped alert (§3): `lying` outside these zones for longer than the dwell bar
     # emits one posture_alert edge per episode. Alert-only — no autonomy attached.
     lying_ok_zones: str = field(default_factory=lambda: os.getenv(

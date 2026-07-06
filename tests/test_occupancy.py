@@ -116,6 +116,7 @@ def test_posture_alert_fires_once_outside_lying_ok_zones():
     cfg.enter_frames = 1
     cfg.lying_alert_dwell_s = 60.0
     cfg.lying_ok_zones = "bedroom,sala"
+    cfg.posture_stable_s = 10.0
     t = OccupancyTracker()
     t.update("cam", "cocina", [Observation("1", posture="lying")], now=0.0)
     e = t.update("cam", "cocina", [Observation("1", posture="lying")], now=30.0)
@@ -124,10 +125,33 @@ def test_posture_alert_fires_once_outside_lying_ok_zones():
     assert any(x.edge == EDGE_POSTURE_ALERT for x in e)
     e = t.update("cam", "cocina", [Observation("1", posture="lying")], now=62.0)
     assert e == [], "one alert per lying episode"
-    # Standing back up re-arms; lying long again re-alerts.
+    # Standing back up (held past the debounce) re-arms; lying long again re-alerts.
     t.update("cam", "cocina", [Observation("1", posture="standing")], now=63.0)
-    e = t.update("cam", "cocina", [Observation("1", posture="lying")], now=64.0)
+    t.update("cam", "cocina", [Observation("1", posture="standing")], now=74.0)  # commits
+    t.update("cam", "cocina", [Observation("1", posture="lying")], now=75.0)
+    e = t.update("cam", "cocina", [Observation("1", posture="lying")], now=86.0)  # commits
     assert any(x.edge == EDGE_POSTURE_ALERT for x in e), "dwell already past the bar"
+
+
+def test_posture_debounce_ignores_frame_exit_flicker():
+    """A brief contradictory read (partial bbox at frame-exit says 'lying') must NOT
+    replace the committed posture; a sustained change past posture_stable_s must."""
+    cfg.enter_frames = 1
+    cfg.posture_stable_s = 10.0
+    t = OccupancyTracker()
+    t.update("cam", "cocina", [Observation("1", posture="standing")], now=0.0)
+    # flicker: lying for 3 s, then standing again — committed posture never moves
+    t.update("cam", "cocina", [Observation("1", posture="lying")], now=60.0)
+    t.update("cam", "cocina", [Observation("1", posture="lying")], now=63.0)
+    assert t.snapshot("cocina", now=63.0)["cocina"][0]["posture"] == "standing"
+    t.update("cam", "cocina", [Observation("1", posture="standing")], now=64.0)
+    # the aborted candidate must not leave residue: a NEW lying spell starts over
+    t.update("cam", "cocina", [Observation("1", posture="lying")], now=100.0)
+    t.update("cam", "cocina", [Observation("1", posture="lying")], now=109.0)
+    assert t.snapshot("cocina", now=109.0)["cocina"][0]["posture"] == "standing"
+    # …and commits once it holds past the bar
+    t.update("cam", "cocina", [Observation("1", posture="lying")], now=110.5)
+    assert t.snapshot("cocina", now=110.5)["cocina"][0]["posture"] == "lying"
 
 
 def test_no_posture_alert_in_lying_ok_zone():

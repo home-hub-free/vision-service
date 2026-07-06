@@ -1,7 +1,16 @@
 """Hub room-digest payload builder — the §3.1 producer push contract (no network)."""
-from app.hub_push import room_digest_payload
+import pytest
+
+from app.hub_push import _reset_hint_hold, room_digest_payload
 from app.occupancy import Identity, Observation, OccupancyTracker
 from app.config import cfg
+
+
+@pytest.fixture(autouse=True)
+def _clean_hint_hold():
+    _reset_hint_hold()
+    yield
+    _reset_hint_hold()
 
 
 def _meta(ident: Identity) -> dict:
@@ -131,3 +140,35 @@ def test_payload_carries_activity_hint_when_a_rule_fires():
     # silent when no rule earns a hint — the fields are simply absent
     body = room_digest_payload("garage", people, hour=7)
     assert "activity_hint" not in body and "activity_hint_conf" not in body
+
+
+def test_hint_holds_through_brief_dropouts_while_occupied():
+    cfg.hints_enabled, cfg.zone_kinds, cfg.hint_hold_s = True, "", 30.0
+    settled = [_p(dwell_s=120.0, posture="standing", cls="household", confidence=0.9)]
+    body = room_digest_payload("cocina", settled, hour=7, now=1000.0)
+    assert body["activity_hint"] == "making breakfast or coffee"
+    # posture flickers (kitchen+lying has no rule) → the hint is HELD, not dropped
+    flicker = [_p(dwell_s=125.0, posture="lying", cls="household", confidence=0.9)]
+    body = room_digest_payload("cocina", flicker, hour=7, now=1005.0)
+    assert body["activity_hint"] == "making breakfast or coffee"
+    # past the hold window with the rules still silent → the hint finally clears
+    body = room_digest_payload("cocina", flicker, hour=7, now=1036.0)
+    assert "activity_hint" not in body
+
+
+def test_hint_replaced_immediately_and_cleared_on_empty_zone():
+    cfg.hints_enabled, cfg.zone_kinds, cfg.hint_hold_s = True, "", 30.0
+    standing = [_p(dwell_s=120.0, posture="standing", cls="household", confidence=0.9)]
+    body = room_digest_payload("cocina", standing, hour=9, now=1000.0)
+    assert body["activity_hint"] == "making breakfast or coffee"
+    # a DIFFERENT fired hint wins immediately — no debounce on real rule output
+    sitting = [_p(dwell_s=150.0, posture="sitting", cls="household", confidence=0.9),
+               _p(dwell_s=140.0, posture="sitting", cls="household", confidence=0.9)]
+    body = room_digest_payload("cocina", sitting, hour=9, now=1005.0)
+    assert body["activity_hint"] == "eating together"
+    # an emptied zone clears the hold instantly (no ghost hint on re-entry)
+    body = room_digest_payload("cocina", [], hour=9, now=1010.0)
+    assert "activity_hint" not in body
+    passing = [_p(dwell_s=3.0, posture="standing", cls="household", confidence=0.9)]
+    body = room_digest_payload("cocina", passing, hour=9, now=1012.0)
+    assert "activity_hint" not in body

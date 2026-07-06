@@ -105,6 +105,10 @@ class _Track:
     # and the once-per-lying-episode latch for the fall-shaped alert.
     posture: Optional[str] = None
     posture_alerted: bool = False
+    # Debounce for posture changes: the candidate posture + when it first disagreed
+    # with the committed one (commits after cfg.posture_stable_s of consistency).
+    posture_pending: Optional[str] = None
+    posture_pending_since: float = 0.0
     # Mirrors Observation.context (constant per camera): False = identity-only track.
     context: bool = True
 
@@ -162,7 +166,7 @@ class OccupancyTracker:
             tr.identity = _better(tr.identity, obs.identity)
             self._update_motion(tr, obs, now)
             if obs.posture is not None:
-                tr.posture = obs.posture
+                self._update_posture(tr, obs.posture, now)
             alert = self._maybe_posture_alert(tr, now)
             if alert is not None:
                 edges.append(alert)
@@ -223,6 +227,24 @@ class OccupancyTracker:
             inst = math.hypot(cx - tr.norm_cx, cy - tr.norm_cy) / (now - tr.pos_ts)
             tr.speed = SPEED_EMA_ALPHA * inst + (1.0 - SPEED_EMA_ALPHA) * tr.speed
         tr.norm_cx, tr.norm_cy, tr.pos_ts = cx, cy, now
+
+    def _update_posture(self, tr: _Track, posture: str, now: float) -> None:
+        """T1 debounce: a NEW posture must be read consistently for posture_stable_s
+        before it replaces the committed one. A partial bbox at frame-exit reads
+        "lying" for a few frames — instant commits flapped the digest and dropped a
+        T2a hint mid-cooking. The first read commits immediately; a candidate that
+        stops being read (person left, posture reverted) simply expires."""
+        if tr.posture is None or posture == tr.posture:
+            if tr.posture is None:
+                tr.posture = posture
+            tr.posture_pending = None
+            return
+        if tr.posture_pending != posture:
+            tr.posture_pending, tr.posture_pending_since = posture, now
+            return
+        if now - tr.posture_pending_since >= cfg.posture_stable_s:
+            tr.posture = posture
+            tr.posture_pending = None
 
     def _maybe_posture_alert(self, tr: _Track, now: float) -> Optional[Edge]:
         """Fall-shaped salience (§3): lying + zone not lying-ok + dwell past the bar →
