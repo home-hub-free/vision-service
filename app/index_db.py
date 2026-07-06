@@ -108,8 +108,11 @@ class EventIndex:
         with _lock:
             conn = self._db()
             try:
-                conn.execute("DELETE FROM segments WHERE cam_id=? AND file=?",
-                             (cam_id, rec_dir))
+                # Legacy rows point at a DIRECTORY — usually this camera's rec_dir,
+                # but a renamed camera leaves rows aimed at its OLD dir (seen live:
+                # mc200 rows → recordings/mc200-entrance), so purge by shape.
+                conn.execute("DELETE FROM segments WHERE cam_id=? AND file NOT LIKE '%.mp4'",
+                             (cam_id,))
                 have = {r[0] for r in conn.execute(
                     "SELECT file FROM segments WHERE cam_id=?", (cam_id,))}
                 added = 0

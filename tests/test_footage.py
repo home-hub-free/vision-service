@@ -56,8 +56,11 @@ def test_sync_indexes_files_idempotently_and_purges_legacy_dir_rows(tmp_path):
     os.makedirs(rec_dir)
     idx = EventIndex(str(tmp_path / "idx.db"))
 
-    # The legacy shape: a recorder-run row pointing at the DIRECTORY, never closed.
+    # The legacy shape: a recorder-run row pointing at the DIRECTORY, never closed —
+    # including one aimed at an OLD directory from before a camera rename.
     legacy = idx.open_segment("cam1", "sala", rec_dir, start_ts=time.time() - 86400)
+    renamed = idx.open_segment("cam1", "sala", os.path.join(rec_root, "cam1-oldname"),
+                               start_ts=time.time() - 86400)
 
     old = time.time() - 7200
     _mp4(rec_dir, _name(old), old + 300)
@@ -65,7 +68,8 @@ def test_sync_indexes_files_idempotently_and_purges_legacy_dir_rows(tmp_path):
     _mp4(rec_dir, _name(time.time() - 4), time.time() - 1)  # growing → not indexed
 
     assert sync_camera(idx, "cam1", "sala", rec_root=rec_root) == 2
-    assert idx.segment_by_id(legacy) is None  # directory row self-healed away
+    assert idx.segment_by_id(legacy) is None   # directory row self-healed away
+    assert idx.segment_by_id(renamed) is None  # old-name directory row too
 
     segs = idx.segments_between("cam1", old - 10, old + 900)
     assert len(segs) == 2
