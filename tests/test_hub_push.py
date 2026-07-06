@@ -97,6 +97,27 @@ def test_payload_without_dwell_data_has_no_activity_field():
     assert "dwell_s" not in body["people"][0]
 
 
+def test_satellite_track_is_identity_only_no_activity_no_hint():
+    """A face-ID-only camera (Observation.context=False — satellite/ESP32 cams) must
+    contribute identity but NO T0/T1/T2a signals: no dwell/moving/posture on the person,
+    no zone activity, no activity hint — even in prime hint conditions."""
+    cfg.enter_frames = 1
+    cfg.hints_enabled, cfg.zone_kinds = True, ""
+    t = OccupancyTracker()
+    t.update("sat1", "cocina",
+             [Observation("1", Identity(id="u1", name="David", cls="household", confidence=0.9),
+                          bbox=(100, 100, 200, 300), frame_w=1000, posture="standing",
+                          context=False)],
+             now=0.0)
+    t.update("sat1", "cocina", [Observation("1", context=False)], now=90.0)
+    body = room_digest_payload("cocina", t.snapshot("cocina", now=90.0).get("cocina", []), hour=7)
+    person = body["people"][0]
+    assert person["name"] == "David"          # identity still crosses
+    assert "dwell_s" not in person and "moving" not in person and "posture" not in person
+    assert "activity" not in body
+    assert "activity_hint" not in body
+
+
 # ── T2a: context-rule activity hint on the digest (plan §4.2a) ────────────────
 
 def test_payload_carries_activity_hint_when_a_rule_fires():

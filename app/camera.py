@@ -228,7 +228,9 @@ class CameraWorker(threading.Thread):
         # motion gate (we're past it), sub-sampled by pose_every_n (posture changes
         # slowly — the cost-gate fallback runs pose every ~3rd detect frame).
         postures: Dict[str, str] = {}
-        if tracks and getattr(self.pose, "backend", "null") != "null":
+        # Satellite/ESP32 cams (not context_capable) skip pose entirely: their frames
+        # can't support full-body inference, and the CPU is better spent elsewhere.
+        if tracks and self.cam.context_capable and getattr(self.pose, "backend", "null") != "null":
             self._pose_counter += 1
             if self._pose_counter % max(1, cfg.pose_every_n) == 0:
                 matched = match_poses_to_tracks(self.pose.detect(frame), tracks)
@@ -280,7 +282,8 @@ class CameraWorker(threading.Thread):
                     self._idents[t.track_id] = fresh
             observations.append(Observation(track_id=t.track_id, identity=ident,
                                             bbox=t.bbox, frame_w=frame_w,
-                                            posture=postures.get(t.track_id)))
+                                            posture=postures.get(t.track_id),
+                                            context=self.cam.context_capable))
             # Live overlay label: real name if known, else the default "Person N" for a
             # guest cluster (every detected person is labelled by default), else "person".
             if ident.name:

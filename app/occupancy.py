@@ -78,6 +78,10 @@ class Observation:
     frame_w: int = 0
     # T1 (§3): coarse body state from pose, when the pose engine ran on this frame.
     posture: Optional[str] = None  # "standing" | "sitting" | "lying" | "bent"
+    # Whether the source camera is context-capable (Camera.context_capable): satellite/
+    # ESP32 cams are face-ID-only — too low-quality for full-body inference — so their
+    # tracks carry identity but NO T0/T1/T2a context signals downstream.
+    context: bool = True
 
 
 @dataclass
@@ -101,6 +105,8 @@ class _Track:
     # and the once-per-lying-episode latch for the fall-shaped alert.
     posture: Optional[str] = None
     posture_alerted: bool = False
+    # Mirrors Observation.context (constant per camera): False = identity-only track.
+    context: bool = True
 
 
 @dataclass
@@ -152,6 +158,7 @@ class OccupancyTracker:
                 self._tracks[key] = tr
             tr.last_seen = now
             tr.hits += 1
+            tr.context = obs.context
             tr.identity = _better(tr.identity, obs.identity)
             self._update_motion(tr, obs, now)
             if obs.posture is not None:
@@ -258,14 +265,17 @@ class OccupancyTracker:
             entry = {
                 "track": tr.key,
                 "since": tr.first_seen,
-                # T0 activity signals (§2): how long they've been here + whether they're
-                # in motion right now (speed EMA vs the passing bar, camera-agnostic).
-                "dwell_s": round(max(0.0, now - tr.first_seen), 1),
-                "moving": tr.speed >= cfg.activity_speed_fws,
                 **tr.identity.as_meta(),
             }
-            if tr.posture:
-                entry["posture"] = tr.posture  # T1 (§3), only once a pose engine read it
+            if tr.context:
+                # T0 activity signals (§2): how long they've been here + whether they're
+                # in motion right now (speed EMA vs the passing bar, camera-agnostic).
+                # Identity-only tracks (satellite cams) omit ALL context fields, which is
+                # what keeps them out of zone activity + T2a hints downstream.
+                entry["dwell_s"] = round(max(0.0, now - tr.first_seen), 1)
+                entry["moving"] = tr.speed >= cfg.activity_speed_fws
+                if tr.posture:
+                    entry["posture"] = tr.posture  # T1 (§3), only once a pose engine read it
             out.setdefault(tr.zone, []).append(entry)
         return out
 

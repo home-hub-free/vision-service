@@ -199,3 +199,15 @@ def test_fetch_cameras_includes_any_device_with_stream_block(monkeypatch):
     assert sat.stream_url == "http://10.0.0.9:81/stream"
     assert sat.snapshot_url == "http://10.0.0.9:81/capture"
     assert sat.zone == "oficina"
+
+
+def test_context_capable_rtsp_yes_mjpeg_satellite_no():
+    # Full-body context (T0 speed / T1 posture / T2a hints) only from real IP cams
+    # (RTSP detect stream). ESP32 satellite/standalone cams (HTTP-MJPEG) are kept for
+    # face ID only — their tracks must stay identity-only.
+    rtsp = parse_static_cameras("mc200@sala@rtsp://u:p@1.2.3.4:554/stream2")[0]
+    assert rtsp.context_capable is True
+    sat = Camera({"id": "6c0057858428", "zone": "oficina", "ip": "1.2.3.5",
+                  "stream": {"path": "/stream", "port": 81}})
+    assert sat.context_capable is False
+    assert Camera({"id": "nostream"}).context_capable is False

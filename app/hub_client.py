@@ -85,6 +85,17 @@ class Camera:
         return f"http://{self.ip}:{port}{snap}"
 
     @property
+    def context_capable(self) -> bool:
+        """Whether this camera's frames are good enough for FULL-BODY inference (T0
+        speed / T1 posture / T2a activity hints). Keyed the same way record scope is:
+        RTSP detect stream = a real IP camera → yes; HTTP-MJPEG = an ESP32 satellite/
+        standalone cam → no. Those are kept for face ID at specific spots only — low-res,
+        corruption-prone frames make pose/activity from them junk, so their tracks carry
+        identity and nothing else."""
+        from .rtsp import is_rtsp
+        return is_rtsp(self.stream_url or "")
+
+    @property
     def record_url(self) -> Optional[str]:
         """Optional full-quality MAIN stream recorded by codec-copy (recorder.py) while
         the reader/detector runs on `stream_url` (the cheap substream) — the dual-stream
