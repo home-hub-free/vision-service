@@ -21,7 +21,8 @@ from .config import cfg
 from .ingest import init_ingestion
 from .perception import annotate_face_in_thumb
 from .retention import Janitor
-from .routes import camctl, enroll, guests, imaging, occupancy, ptz, recordings, streams
+from .routes import (camctl, enroll, guests, imaging, occupancy, privacy, ptz,
+                     recordings, streams)
 from .state import gallery, index
 from .supervisor import Supervisor
 
@@ -67,6 +68,8 @@ app.include_router(guests.router)
 app.include_router(ptz.router)
 app.include_router(imaging.router)
 app.include_router(camctl.router)
+# Privacy mode: per-camera stop-streaming/recording switch (via the hub proxy).
+app.include_router(privacy.router)
 
 # HLS playback (§6/§11.5 alternative delivery) — the recorder writes live.m3u8 here.
 os.makedirs(cfg.hls_dir, exist_ok=True)

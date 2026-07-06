@@ -40,7 +40,7 @@ from .perception import (assign_faces_to_tracks, classify_posture, crop_jpeg,
                          decode_jpeg, draw_overlay, face_crop_jpeg, make_detector,
                          make_face_engine, make_pose_engine, match_poses_to_tracks)
 from .recorder import Recorder
-from .state import gallery, index, tracker
+from .state import gallery, index, privacy, tracker
 
 
 class CameraWorker(threading.Thread):
@@ -63,6 +63,15 @@ class CameraWorker(threading.Thread):
         # thread finishes/joins; shadowing it with an Event breaks join() ("'Event' object
         # is not callable"). Same trap as _ident/_idents above.
         self._stop_evt = threading.Event()
+
+        # Privacy mode (app/privacy.py): while private the reader never connects, so
+        # nothing downstream (stream/record/perception/occupancy) can see the camera.
+        # `_privacy_applied` makes the teardown idempotent (reader loop + the route's
+        # immediate `pause_for_privacy` may both run it); `_rec_started` defers the
+        # recorder's first start out of run()'s head so a camera that BOOTS private
+        # never opens ffmpeg at all.
+        self._privacy_applied = False
+        self._rec_started = False
 
         # latest frames for the dashboard re-serve.
         self.latest_raw: Optional[bytes] = None
@@ -106,12 +115,17 @@ class CameraWorker(threading.Thread):
     # ── lifecycle ─────────────────────────────────────────────────────────────
     def run(self) -> None:
         """READER thread: drain the camera continuously; never run inference here."""
-        self.recorder.start()
         self._proc_thread = threading.Thread(
             target=self._process_loop, name=f"vision-proc-{self.cam.id}", daemon=True)
         self._proc_thread.start()
         backoff = 1.0
         while not self._stop_evt.is_set():
+            if self.is_private():
+                self.pause_for_privacy()  # idempotent — usually already applied
+                if self._stop_evt.wait(1.0):
+                    break
+                continue
+            self._resume_from_privacy()  # also the recorder's FIRST start
             try:
                 self._pump()
                 backoff = 1.0
@@ -137,10 +151,51 @@ class CameraWorker(threading.Thread):
         with self._frame_cv:  # unblock the processor's wait()
             self._frame_cv.notify_all()
 
+    # ── privacy mode ──────────────────────────────────────────────────────────
+    def is_private(self) -> bool:
+        return privacy.is_private(self.cam.id)
+
+    def pause_for_privacy(self) -> None:
+        """Go dark NOW (also called from the toggle route's thread, so the recorder
+        stops writing before the HTTP response returns — the reader converges within
+        a frame). Closes the recorder (passthrough ffmpeg included), drops the
+        pre-roll ring and the relay frames, and silently withdraws this camera's
+        occupancy so /occupancy can't show people frozen at the pause instant."""
+        # Relay slots clear OUTSIDE the idempotence gate: a frame mid-flight through
+        # _on_frame when the toggle lands can repopulate them just after the teardown —
+        # the reader loop re-calls this every second while private, sweeping it out.
+        self.latest_raw = None
+        self.latest_annotated = None
+        self.last_frame_ts = 0.0
+        if self._privacy_applied:
+            return
+        self._privacy_applied = True
+        self.recorder.stop()
+        self.recorder.clear_ring()
+        self._present = False
+        with self._frame_cv:  # a queued frame must not be processed post-toggle
+            self._pending_frame = None
+        tracker.drop_camera(self.cam.id)
+        print(f"[vision] cam {self.cam.id} privacy ON — stream, recording and "
+              f"perception paused", flush=True)
+
+    def _resume_from_privacy(self) -> None:
+        """(Re)arm the recorder — the first start after boot, and every resume."""
+        if self._rec_started and not self._privacy_applied:
+            return
+        self._rec_started = True
+        self.recorder.start()
+        if self._privacy_applied:
+            self._privacy_applied = False
+            print(f"[vision] cam {self.cam.id} privacy OFF — resuming", flush=True)
+
     def _pump(self) -> None:
         url = self.cam.stream_url
         if not url:
             raise RuntimeError("no stream url")
+        # Reader bail-out: shutdown OR privacy — both must break the drain loop fast
+        # (privacy takes effect within one frame, not one reconnect).
+        halt = lambda: self._stop_evt.is_set() or self.is_private()  # noqa: E731
         # Auto-select transport by URL scheme: rtsp:// (Reolink/Amcrest/Dahua/Tapo/ONVIF)
         # decodes via OpenCV's FFmpeg backend; everything else is HTTP-MJPEG (ESP32-CAM).
         if is_rtsp(url):
@@ -148,9 +203,9 @@ class CameraWorker(threading.Thread):
             print(f"[vision] cam {self.cam.id} streaming (rtsp) from {redact_url(url)}", flush=True)
             try:
                 # closing() guarantees cap.release() when the reader stops/reconnects.
-                with contextlib.closing(iter_rtsp_frames(url, self._stop_evt.is_set)) as frames:
+                with contextlib.closing(iter_rtsp_frames(url, halt)) as frames:
                     for jpeg in frames:
-                        if self._stop_evt.is_set():
+                        if halt():
                             break
                         self._on_frame(jpeg)
             finally:
@@ -161,7 +216,7 @@ class CameraWorker(threading.Thread):
         print(f"[vision] cam {self.cam.id} streaming (mjpeg) from {url}", flush=True)
         try:
             for jpeg in iter_jpeg_frames(resp.read):
-                if self._stop_evt.is_set():
+                if halt():
                     break
                 self._on_frame(jpeg)
         finally:
@@ -173,6 +228,8 @@ class CameraWorker(threading.Thread):
 
     # ── reader: per-frame, CHEAP only (no inference — see module docstring) ─────
     def _on_frame(self, jpeg: bytes) -> None:
+        if self.is_private():
+            return  # belt-and-braces: the pump loop is about to break anyway
         now = time.time()
         self.latest_raw = jpeg          # full-rate relay slot for the dashboard
         self.last_frame_ts = now
@@ -197,8 +254,8 @@ class CameraWorker(threading.Thread):
                     self._frame_cv.wait(timeout=1.0)
                 jpeg = self._pending_frame
                 self._pending_frame = None
-            if jpeg is None or self._stop_evt.is_set():
-                continue
+            if jpeg is None or self._stop_evt.is_set() or self.is_private():
+                continue  # a frame queued just before a privacy toggle is dropped
             # Pace the heavy pipeline at detect_fps (the reader/relay stays full-rate).
             now = time.time()
             if cfg.detect_fps > 0:
@@ -420,6 +477,8 @@ class CameraWorker(threading.Thread):
         dashboard views THIS, never the camera directly (a 2nd client stalls the cam)."""
         last_sent = 0.0
         while not self._stop_evt.is_set():
+            if self.is_private():
+                return  # end the multipart response — a viewer must not hold a frozen feed
             frame = (self.latest_annotated if annotated else None) or self.latest_raw
             if frame is not None and self.last_frame_ts != last_sent:
                 last_sent = self.last_frame_ts
@@ -441,6 +500,7 @@ class CameraWorker(threading.Thread):
             "pose": self.pose.backend,
             "rec_mode": self.recorder.mode,
             "records": self.recorder.mode != "off",
+            "privacy": self.is_private(),
             "onvif": caps,
             "events_attached": self.events_attached,
             "motion_active": self.motion_active if self.events_attached else None,

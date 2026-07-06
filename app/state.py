@@ -10,10 +10,12 @@ from typing import Dict
 from .gallery import Gallery
 from .index_db import EventIndex
 from .occupancy import OccupancyTracker
+from .privacy import PrivacyStore
 
 tracker = OccupancyTracker()
 gallery = Gallery()
 index = EventIndex()
+privacy = PrivacyStore()
 
 # cam_id -> CameraWorker (typed loosely to avoid importing camera.py here).
 workers: Dict[str, object] = {}

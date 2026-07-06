@@ -275,6 +275,23 @@ class OccupancyTracker:
         left_at = self._recent_left.get(zone, {}).get(ident.key())
         return left_at is not None and (now - left_at) < cfg.rewake_cooldown_s
 
+    # ── privacy withdrawal ────────────────────────────────────────────────────
+    def drop_camera(self, cam_id: str) -> None:
+        """Withdraw one camera's observations SILENTLY (privacy mode): its tracks
+        vanish from the snapshot without emitting left/room-empty edges — the people
+        may well still be there, the camera just stopped looking, so fabricating
+        `person_left` events would poison memory. Downstream (the hub's rooms model)
+        goes stale-then-unknown via its vision TTL, which is the honest signal."""
+        zones = set()
+        for key, tr in list(self._tracks.items()):
+            if tr.cam_id != cam_id:
+                continue
+            zones.add(tr.zone)
+            del self._tracks[key]
+        for zone in zones:
+            self._zone_occupied[zone] = any(
+                t.present for t in self._tracks.values() if t.zone == zone)
+
     # ── snapshot (pull surface — who_is_here) ─────────────────────────────────
     def snapshot(self, zone: Optional[str] = None, now: Optional[float] = None) -> dict:
         now = time.time() if now is None else now

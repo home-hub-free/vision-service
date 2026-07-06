@@ -15,7 +15,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response, StreamingResponse
 
 from ..mjpeg import MJPEG_BOUNDARY
-from ..state import workers
+from ..state import privacy, workers
 
 router = APIRouter()
 
@@ -24,6 +24,10 @@ def _worker(cam_id: str):
     w = workers.get(cam_id)
     if w is None:
         raise HTTPException(status_code=404, detail="camera not found / no worker")
+    # Privacy mode (app/privacy.py): the worker holds no frames while private, but
+    # answer 423 rather than a stalled multipart so a viewer sees WHY it's dark.
+    if privacy.is_private(cam_id):
+        raise HTTPException(status_code=423, detail="camera is in privacy mode")
     return w
 
 

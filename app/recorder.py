@@ -133,6 +133,12 @@ class Recorder:
     def stop(self) -> None:
         self._close()
 
+    def clear_ring(self) -> None:
+        """Drop the pre-roll ring (privacy pause): frames buffered before the pause
+        would be flushed into the NEXT clip's head on resume — after a privacy gap
+        they're stale context from another moment, so start the next clip clean."""
+        self._ring.clear()
+
     def _open(self) -> None:
         with self._lock:
             if self._proc is not None or self.mode == "off" or not ffmpeg_available():

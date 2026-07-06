@@ -225,6 +225,11 @@ class Config:
     disk_cap_gb: float = field(default_factory=lambda: _f("VISION_DISK_CAP_GB", 0.0))  # 0 = no cap (age-only)
     janitor_interval_s: float = field(default_factory=lambda: _f("VISION_JANITOR_INTERVAL_S", 600.0))
 
+    # ── privacy mode (per-camera "stop watching NOW" — see app/privacy.py) ───
+    # Persisted set of private cam ids; must survive restarts, so it's a file in
+    # DATA next to the gallery/index DBs, not an env flag.
+    privacy_file: str = field(default_factory=lambda: os.getenv("VISION_PRIVACY_FILE", os.path.join(DATA, "privacy.json")))
+
     # ── gallery + guests (§4.3 / §11.6 / §11.7 — biometrics stay on the box) ─
     gallery_db: str = field(default_factory=lambda: os.getenv("VISION_GALLERY_DB", os.path.join(DATA, "gallery.db")))
     index_db: str = field(default_factory=lambda: os.getenv("VISION_INDEX_DB", os.path.join(DATA, "index.db")))
