@@ -173,13 +173,25 @@ class Recorder:
         with self._lock:
             if self._proc is None:
                 return
+            proc, self._proc = self._proc, None
             try:
-                if self._proc.stdin:
-                    self._proc.stdin.close()
-                self._proc.terminate()
+                if proc.stdin:
+                    proc.stdin.close()
+                proc.terminate()
             except Exception:  # noqa: BLE001
                 pass
-            self._proc = None
+            # REAP, don't just signal: without wait() every closed encoder lingers
+            # as a zombie for the service's lifetime, and a hung ffmpeg would keep
+            # recording after "stop" — privacy mode depends on stop meaning STOPPED,
+            # so escalate to SIGKILL if it ignores the TERM (normal exit is <1s).
+            try:
+                proc.wait(timeout=5.0)
+            except Exception:  # noqa: BLE001 — TimeoutExpired or already-gone races
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
+                except Exception:  # noqa: BLE001
+                    pass
             if self._seg_id is not None:
                 self.index.close_segment(self._seg_id)
                 self._seg_id = None
