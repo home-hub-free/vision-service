@@ -32,13 +32,15 @@ from typing import Dict, List, Optional
 
 from . import hub_push, ingest
 from .config import cfg
+from .highres import make_highres_sampler
 from .hub_client import Camera
 from .mjpeg import iter_jpeg_frames, multipart_chunk, open_stream
 from .rtsp import is_rtsp, iter_rtsp_frames, redact_url
 from .occupancy import Identity, Observation, UNKNOWN
-from .perception import (assign_faces_to_tracks, classify_posture, crop_jpeg,
-                         decode_jpeg, draw_overlay, face_crop_jpeg, make_detector,
-                         make_face_engine, make_pose_engine, match_poses_to_tracks)
+from .perception import (DetectedTrack, assign_faces_to_tracks, classify_posture,
+                         crop_jpeg, decode_jpeg, draw_overlay, face_crop_jpeg,
+                         make_detector, make_face_engine, make_pose_engine,
+                         match_poses_to_tracks)
 from .recorder import Recorder
 from .state import gallery, index, privacy, tracker
 
@@ -59,6 +61,10 @@ class CameraWorker(threading.Thread):
         self.recorder = Recorder(cam.id, cam.zone, index,
                                  mode=(cfg.rec_mode_default if records else "off"),
                                  record_url=cam.record_url)
+        # On-demand high-res sampling (highres.py): dual-stream IP cams only. The
+        # ONVIF getter is lazy — the supervisor attaches `_onvif` after start.
+        self.highres = make_highres_sampler(
+            cam, get_onvif=lambda: getattr(self, "_onvif", None))
         # NB: not `_stop` — threading.Thread._stop is an internal METHOD it calls when a
         # thread finishes/joins; shadowing it with an Event breaks join() ("'Event' object
         # is not callable"). Same trap as _ident/_idents above.
@@ -316,8 +322,10 @@ class CameraWorker(threading.Thread):
                 emb, thumb, thumb_box = embeds.get(t.track_id, (None, None, None))
                 if emb is not None:
                     try:
-                        ident = gallery.resolve(emb, thumb or crop_jpeg(frame, t.bbox),
-                                                thumb_box=thumb_box)
+                        ident = gallery.resolve(
+                            emb,
+                            thumb or crop_jpeg(frame, t.bbox, max_dim=cfg.capture_crop_px),
+                            thumb_box=thumb_box)
                     except Exception as e:  # noqa: BLE001 — a gallery failure on ONE face
                         # must not abort the frame (it would also drop occupancy, edges
                         # and every other track — a DB hiccup blinded whole frames once).
@@ -400,12 +408,49 @@ class CameraWorker(threading.Thread):
         return self.motion_active or (now - self.last_motion_ts) < cfg.motion_linger_s
 
     def _embed_tracks(self, frame, tracks, wanted) -> Dict[str, tuple]:
-        """(emb, thumb, thumb_box) per wanted track id. With ONE person in frame the
-        per-crop path (`_embed_track`) stands; with SEVERAL, faces are detected once at
-        frame level and assigned to tracks EXCLUSIVELY by containment
-        (`assign_faces_to_tracks`) — the per-crop "largest face in my box" rule embeds
-        the other person's face when person boxes overlap, which is how two people in
-        one room end up wearing each other's names."""
+        """(emb, thumb, thumb_box) per wanted track id — one substream pass, then an
+        optional HIGH-RES upgrade for faces the substream found but too SMALL to embed
+        cleanly (under highres_min_face_px — ArcFace tops out at 112px, and far-face
+        noise is what seeded 146 clusters for 3 people). The sampler fetches ONE
+        full-res frame shared by every small face in the pass; track boxes scale
+        linearly between the streams. If the sampler is healthy but momentarily
+        rate-limited, small-face RESOLVES are held back a pass (the track retries in
+        ~200 ms and catches the grab) rather than seeding a noisy guest cluster; a
+        degraded sampler passes substream embeddings through unchanged."""
+        out = self._embed_pass(frame, tracks, wanted)
+        min_px = cfg.highres_min_face_px
+        if self.highres is None or min_px <= 0:
+            return {tid: v[:3] for tid, v in out.items()}
+        small = [tid for tid, (emb, _t, _tb, px) in out.items()
+                 if emb is not None and 0 < px < min_px]
+        if small:
+            hi = self.highres.get_frame()
+            if hi is not None:
+                sx = hi.shape[1] / frame.shape[1]
+                sy = hi.shape[0] / frame.shape[0]
+                hi_tracks = [DetectedTrack(track_id=t.track_id,
+                                           bbox=(int(t.bbox[0] * sx), int(t.bbox[1] * sy),
+                                                 int(t.bbox[2] * sx), int(t.bbox[3] * sy)))
+                             for t in tracks]
+                hi_out = self._embed_pass(hi, hi_tracks, {tid: wanted[tid] for tid in small})
+                for tid in small:
+                    emb, thumb, thumb_box, px = hi_out.get(tid, (None, None, None, 0))
+                    if emb is not None:  # no face on the hi frame → keep the lo result
+                        out[tid] = (emb, thumb, thumb_box, px)
+            elif not self.highres.degraded:
+                for tid in small:
+                    if wanted.get(tid) == "resolve":
+                        out[tid] = (None, None, None, 0)
+        return {tid: v[:3] for tid, v in out.items()}
+
+    def _embed_pass(self, frame, tracks, wanted) -> Dict[str, tuple]:
+        """(emb, thumb, thumb_box, face_px) per wanted track id, on ONE frame. With one
+        person in frame the per-crop path (`_embed_track`) stands; with SEVERAL, faces
+        are detected once at frame level and assigned to tracks EXCLUSIVELY by
+        containment (`assign_faces_to_tracks`) — the per-crop "largest face in my box"
+        rule embeds the other person's face when person boxes overlap, which is how two
+        people in one room end up wearing each other's names. `face_px` is the detected
+        face's longest side (0 when unknown) — the high-res upgrade trigger."""
         out: Dict[str, tuple] = {}
         if not wanted:
             return out
@@ -417,12 +462,13 @@ class CameraWorker(threading.Thread):
             for tid in wanted:
                 hit = assigned.get(tid)
                 if hit is None:
-                    out[tid] = (None, None, None)
+                    out[tid] = (None, None, None, 0)
                     continue
                 emb, fbox = hit
-                packed = face_crop_jpeg(frame, fbox)
+                packed = face_crop_jpeg(frame, fbox, max_dim=cfg.capture_crop_px)
                 thumb, thumb_box = packed if packed is not None else (None, None)
-                out[tid] = (emb, thumb, thumb_box)
+                out[tid] = (emb, thumb, thumb_box,
+                            max(fbox[2] - fbox[0], fbox[3] - fbox[1]))
             return out
         for t in tracks:
             if t.track_id in wanted:
@@ -449,22 +495,24 @@ class CameraWorker(threading.Thread):
                 self._ident_ts.pop(tid, None)
 
     def _embed_track(self, frame, bbox):
-        """(embedding, thumb, thumb_box) for one track's person box.
+        """(embedding, thumb, thumb_box, face_px) for one track's person box.
         Prefer the face-box-aware path: the thumbnail is then a face-CENTERED crop of
         exactly the matched face (never a full-body sliver, never an ambiguous
         two-person box), and the face's position within it rides along so the review
-        card can ring it. All three are None-able (no face found / engine w/o API)."""
-        emb, thumb, thumb_box = None, None, None
+        card can ring it. face_px = the face's longest side (0 unknown) — the high-res
+        upgrade trigger. All None-able (no face found / engine w/o API)."""
+        emb, thumb, thumb_box, face_px = None, None, None, 0
         if hasattr(self.face, "embed_face"):
             hit = self.face.embed_face(frame, bbox)
             if hit is not None:
                 emb, fbox = hit
-                packed = face_crop_jpeg(frame, fbox)
+                face_px = max(fbox[2] - fbox[0], fbox[3] - fbox[1])
+                packed = face_crop_jpeg(frame, fbox, max_dim=cfg.capture_crop_px)
                 if packed is not None:
                     thumb, thumb_box = packed
         else:  # engines without the face-box API — old person-crop behavior
             emb = self.face.embed(frame, bbox)
-        return emb, thumb, thumb_box
+        return emb, thumb, thumb_box, face_px
 
     def _prune_idents(self, live: set) -> None:
         if len(self._idents) > 256:
@@ -501,6 +549,7 @@ class CameraWorker(threading.Thread):
             "rec_mode": self.recorder.mode,
             "records": self.recorder.mode != "off",
             "privacy": self.is_private(),
+            "highres": self.highres.status() if self.highres else None,
             "onvif": caps,
             "events_attached": self.events_attached,
             "motion_active": self.motion_active if self.events_attached else None,

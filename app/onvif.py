@@ -186,6 +186,19 @@ class OnvifClient:
             self._profile = toks[0] if toks else "profile_1"
             return self._profile
 
+    def snapshot_uri(self) -> Optional[str]:
+        """Media GetSnapshotUri for the first (= main/high-res) profile, or None when
+        the camera doesn't support it — the C110 answers with a SOAP fault (verified
+        live 2026-07-06), so None routes the high-res sampler to its RTSP fallback."""
+        try:
+            xml = self.call(self.media,
+                            f"<trt:GetSnapshotUri><trt:ProfileToken>{self.profile_token()}"
+                            "</trt:ProfileToken></trt:GetSnapshotUri>")
+        except OnvifError:
+            return None
+        m = re.search(r"<[\w:]*Uri>([^<]+)</", xml)
+        return m.group(1).strip() if m else None
+
     def video_source_token(self) -> str:
         with self._lock:
             if self._vsrc:

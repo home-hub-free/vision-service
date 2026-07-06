@@ -228,6 +228,34 @@ def main() -> int:
     elif cmd == "reboot":
         xml = cam.call(cam.dev, f'<SystemReboot xmlns="{TDS}"/>')
         print("  reboot:", clean(tags(xml, "Message")[0]) if tags(xml, "Message") else xml[:200])
+    elif cmd == "snapshot":
+        # GetSnapshotUri for each profile + fetch a test JPEG (no-auth, then basic) —
+        # the probe behind the on-demand high-res sampler (app/highres.py).
+        import base64
+        import urllib.request
+        xml = cam.call(cam.media, "<trt:GetProfiles/>")
+        toks = re.findall(r'<[\w:]*Profiles[^>]*token="([^"]+)"', xml)
+        for tok in toks or ["profile_1"]:
+            xml = cam.call(cam.media, f"<trt:GetSnapshotUri><trt:ProfileToken>{tok}</trt:ProfileToken></trt:GetSnapshotUri>")
+            uris = tags(xml, "Uri")
+            uri = clean(uris[0]) if uris else None
+            print(f"  profile {tok}: uri={uri}")
+            if not uri:
+                print(f"    raw: {xml[:400]}")
+                continue
+            for label, hdr in (("no-auth", None),
+                               ("basic", "Basic " + base64.b64encode(
+                                   f"{user}:{passwd}".encode()).decode())):
+                req = urllib.request.Request(uri)
+                if hdr:
+                    req.add_header("Authorization", hdr)
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        data = r.read()
+                    print(f"    GET {label}: {len(data)} bytes jpeg={data[:2] == bytes([0xFF, 0xD8])}")
+                    break
+                except Exception as e:  # noqa: BLE001
+                    print(f"    GET {label}: {e}")
     else:
         print(__doc__)
         return 2

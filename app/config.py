@@ -238,6 +238,24 @@ class Config:
     guest_min_sightings: int = field(default_factory=lambda: _i("VISION_GUEST_MIN_SIGHTINGS", 3))  # surface to review
     guest_ttl_days: int = field(default_factory=lambda: _i("VISION_GUEST_TTL_DAYS", 30))
 
+    # ── on-demand high-res sampling (the far-face accuracy lever) ─────────────
+    # Detect/track stays on the cheap substream; when a NEW track's face is found but
+    # SMALL (under min_face_px on the substream — the noisy-embedding zone that seeded
+    # 146 clusters for 3 people), ONE full-res frame is fetched from the camera's main
+    # source and the face re-embedded from it. ArcFace normalizes to 112×112, so
+    # ~110px-wide faces gain nothing (near cams skip this entirely) while a 50px face
+    # doubling to 100px is the difference between cluster fodder and a clean match.
+    # Near-zero continuous cost: fires only on new/re-verified tracks, rate-limited per
+    # camera, and only cameras with a dual-stream main (`record_url`) participate.
+    # Source order: declared snapshot URL → ONVIF GetSnapshotUri (probed once; the
+    # C110 faults on it — verified 2026-07-06) → one-frame RTSP grab of the main
+    # stream. Repeated failures (e.g. the camera caps concurrent RTSP sessions) mark
+    # the sampler degraded: substream embeddings pass through unchanged and retries
+    # slow to 10× the interval, so a broken source can never starve recognition.
+    highres_enabled: bool = field(default_factory=lambda: _b("VISION_HIGHRES_ENABLED", True))
+    highres_min_face_px: int = field(default_factory=lambda: _i("VISION_HIGHRES_MIN_FACE_PX", 90))
+    highres_interval_s: float = field(default_factory=lambda: _f("VISION_HIGHRES_INTERVAL_S", 3.0))
+
     # ── capture ledger (identity-pollution insurance) ─────────────────────────
     # The gallery centroids are running means: once an embedding is folded into a
     # member it can never be exactly recovered (reinforce folds especially). This
@@ -249,6 +267,12 @@ class Config:
     # week is a few MB). Dir default "" = a `captures/` folder next to the gallery DB.
     captures_enabled: bool = field(default_factory=lambda: _b("VISION_CAPTURES_ENABLED", True))
     captures_dir: str = field(default_factory=lambda: os.getenv("VISION_CAPTURES_DIR", ""))
+    # Longest side of the stored face/person crops (ledger + review cards). Display
+    # and archive only — embeddings are computed from the live frame BEFORE the crop
+    # is downscaled, so this knob buys reviewability/re-embeddability, never accuracy.
+    # 480 ≈ 30 KB/crop vs 220px ≈ 10 KB: cheap insurance that the archived ingredient
+    # is comfortably judgeable by a human and re-embeddable if its ledger row is lost.
+    capture_crop_px: int = field(default_factory=lambda: _i("VISION_CAPTURE_CROP_PX", 480))
 
     # ── review tiers (self-healing gallery — how a guest cluster resolves) ───
     # Each unpromoted cluster is scored against the household centroids and lands in
