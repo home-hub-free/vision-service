@@ -95,3 +95,18 @@ def test_payload_without_dwell_data_has_no_activity_field():
     body = room_digest_payload("sala", [_p(name="Ana", cls="household", confidence=0.9, id="u2")])
     assert "activity" not in body
     assert "dwell_s" not in body["people"][0]
+
+
+# ── T2a: context-rule activity hint on the digest (plan §4.2a) ────────────────
+
+def test_payload_carries_activity_hint_when_a_rule_fires():
+    cfg.hints_enabled, cfg.zone_kinds = True, ""
+    people = [_p(dwell_s=120.0, posture="standing", name="David", cls="household",
+                 confidence=0.9, id="u1")]
+    body = room_digest_payload("cocina", people, hour=7)
+    assert body["activity"] == "settled+standing"
+    assert body["activity_hint"] == "making breakfast or coffee"
+    assert body["activity_hint_conf"] == "medium"
+    # silent when no rule earns a hint — the fields are simply absent
+    body = room_digest_payload("garage", people, hour=7)
+    assert "activity_hint" not in body and "activity_hint_conf" not in body

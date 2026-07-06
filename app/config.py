@@ -171,6 +171,16 @@ class Config:
     # remain the primary push; this is NOT per-frame spam.
     digest_heartbeat_s: float = field(default_factory=lambda: _f("VISION_DIGEST_HEARTBEAT_S", 30.0))
 
+    # ── T2a activity hints: context rules (plan §4.2a — no model, digest-build only) ─
+    # zone-kind × dwell × posture × hour → a hedged activity HINT on the digest
+    # ("making breakfast or coffee"). Pure code over T0/T1 fields, evaluated only when
+    # a digest is built (never per frame). Flag off = the tier's §8 kill switch.
+    hints_enabled: bool = field(default_factory=lambda: _b("VISION_ACTIVITY_HINTS", True))
+    # Zone-name → kind overrides, "zone=kind,zone2=kind" (kinds: kitchen|dining|living|
+    # office|bedroom|entrance|bathroom). The built-in es/en synonym table covers the
+    # common names; this knob exists for zones the table can't guess ("cueva=office").
+    zone_kinds: str = field(default_factory=lambda: os.getenv("VISION_ZONE_KINDS", ""))
+
     # ── T1 posture: pose → body state (plan §3 — CPU, motion-gated, cost-gated) ─
     # "null" ships the tier dark; "ultralytics" runs yolov8n-pose on the SAME cadence
     # as detect, only on frames that already have person tracks. `pose_every_n` is the

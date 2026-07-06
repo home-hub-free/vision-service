@@ -26,6 +26,7 @@ import urllib.error
 import urllib.request
 from typing import List, Optional
 
+from .actions import activity_hint
 from .config import cfg
 
 
@@ -63,7 +64,8 @@ def zone_activity(snapshot_people: List[dict]) -> Optional[str]:
     return f"{act}+{posture}" if posture else act
 
 
-def room_digest_payload(zone: str, snapshot_people: List[dict]) -> dict:
+def room_digest_payload(zone: str, snapshot_people: List[dict],
+                        hour: Optional[int] = None) -> dict:
     """Pure builder: a zone's `tracker.snapshot(zone)` people list → the /perception body.
 
     `snapshot_people` is the per-zone list `OccupancyTracker.snapshot()` returns (each entry
@@ -96,6 +98,11 @@ def room_digest_payload(zone: str, snapshot_people: List[dict]) -> dict:
     activity = zone_activity(snapshot_people)
     if activity:
         body["activity"] = activity
+    # T2a (plan §4.2a): context-rule hint over the same signals — additive, hedged
+    # downstream ("likely …"/"possibly …"); `hour` is injectable for tests.
+    hint = activity_hint(zone, snapshot_people, hour=hour)
+    if hint:
+        body["activity_hint"], body["activity_hint_conf"] = hint
     return body
 
 
