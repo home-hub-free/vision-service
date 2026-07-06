@@ -25,6 +25,7 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from ..config import cfg
+from ..footage import sync_camera
 from ..hub_client import require_user
 from ..media_token import sign_clip, verify_clip
 from ..state import index, workers
@@ -46,10 +47,13 @@ def _recording_cams() -> list:
 @router.get("/recordings/cameras")
 def recording_cameras(authorization: Optional[str] = Header(None)):
     """Every camera that records, with the distinct days it has footage for (the day
-    picker). Bearer-gated — footage is only browsable by a signed-in member."""
+    picker). Bearer-gated — footage is only browsable by a signed-in member.
+    Syncs each camera's index from disk first (footage.py) so a just-finished
+    chunk is browsable immediately — the files are the truth, not the DB."""
     require_user(authorization)
     cams = []
     for c in _recording_cams():
+        sync_camera(index, c["id"], c["zone"])
         cams.append({**c, "days": index.recording_days(c["id"])})
     return {"cameras": cams}
 
@@ -61,8 +65,9 @@ def segments(cam_id: str, start: float, end: float,
     a signed clip URL and the identity/event markers that fall inside it — the timeline
     pins ("David entered") the reviewer scrubs between. Bearer-gated."""
     require_user(authorization)
-    segs = index.segments_between(cam_id, start, end)
     zone = next((c["zone"] for c in _recording_cams() if c["id"] == cam_id), None)
+    sync_camera(index, cam_id, zone or "_")
+    segs = index.segments_between(cam_id, start, end)
     out = []
     for s in segs:
         markers = [

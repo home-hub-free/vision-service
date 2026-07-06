@@ -92,8 +92,21 @@ class Janitor(threading.Thread):
                 res = sweep(cfg.rec_dir, cfg.retention_days, cfg.disk_cap_gb, self.index)
                 if res["removed"]:
                     print(f"[vision] janitor pruned {res['removed']} segment(s)", flush=True)
+                self._sync_footage()
             except Exception as e:  # noqa: BLE001 — the janitor must never crash the box
                 print(f"[vision] janitor error: {e}", flush=True)
+
+    def _sync_footage(self) -> None:
+        """Keep the per-file segment index fresh between dashboard visits (the
+        /recordings routes also sync on demand — this just bounds the drift and
+        heals the legacy directory-shaped rows without waiting for a visit)."""
+        from .footage import sync_camera  # late import — retention stays light for tests
+        from .state import workers
+
+        for cam_id, w in list(workers.items()):
+            st = w.status() if hasattr(w, "status") else {}
+            if st.get("records"):
+                sync_camera(self.index, cam_id, st.get("zone") or "_")
 
     def stop(self) -> None:
         self._stop.set()

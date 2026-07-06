@@ -98,6 +98,34 @@ class EventIndex:
             finally:
                 conn.close()
 
+    def sync_file_segments(self, cam_id: str, zone: str, rec_dir: str,
+                           entries) -> int:
+        """Reconcile one camera's rows with its on-disk files (footage.py): insert
+        a row per new finished mp4 and purge the legacy recorder-run rows that
+        pointed at the DIRECTORY (unplayable + never-closing — see footage.py).
+        One transaction under the module lock so concurrent route calls can't
+        double-insert a file. Returns how many rows were added."""
+        with _lock:
+            conn = self._db()
+            try:
+                conn.execute("DELETE FROM segments WHERE cam_id=? AND file=?",
+                             (cam_id, rec_dir))
+                have = {r[0] for r in conn.execute(
+                    "SELECT file FROM segments WHERE cam_id=?", (cam_id,))}
+                added = 0
+                for path, start_ts, end_ts in entries:
+                    if path in have:
+                        continue
+                    conn.execute(
+                        "INSERT INTO segments (cam_id, zone, start_ts, end_ts, file) VALUES (?,?,?,?,?)",
+                        (cam_id, zone, start_ts, end_ts, path),
+                    )
+                    added += 1
+                conn.commit()
+                return added
+            finally:
+                conn.close()
+
     def prune_segment(self, file: str) -> None:
         """Drop the index row when the retention janitor deletes a file."""
         with _lock:

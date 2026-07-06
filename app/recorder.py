@@ -80,6 +80,9 @@ class Recorder:
                  record_url: Optional[str] = None) -> None:
         self.cam_id = cam_id
         self.zone = zone
+        # NB: `index` is no longer written from here — segment rows are synced from
+        # the on-disk files (footage.py); a recorder-run row pointing at rec_dir was
+        # unplayable by the clip route and never closed on SIGKILL.
         self.index = index
         self.mode = mode or cfg.rec_mode_default
         # Dual-stream: when a full-quality MAIN rtsp:// stream is supplied, record it by
@@ -91,7 +94,6 @@ class Recorder:
             self.mode = "continuous"  # codec-copy can't pre-roll a decoded-frame ring
         self.fps = cfg.rec_fps
         self._proc: Optional[subprocess.Popen] = None
-        self._seg_id: Optional[int] = None
         self._lock = threading.Lock()
         # Pre-roll ring buffer (gated): keep ~preroll_seconds of recent frames.
         self._ring: Deque[Tuple[float, bytes]] = collections.deque(maxlen=max(1, int(cfg.preroll_seconds * self.fps)))
@@ -127,8 +129,6 @@ class Recorder:
             except Exception as e:  # noqa: BLE001
                 print(f"[vision] recorder({self.cam_id}) rtsp-copy start failed: {e}", flush=True)
                 self._proc = None
-                return
-            self._seg_id = self.index.open_segment(self.cam_id, self.zone, self.rec_dir)
 
     def stop(self) -> None:
         self._close()
@@ -164,7 +164,6 @@ class Recorder:
                 print(f"[vision] recorder({self.cam_id}) ffmpeg start failed: {e}", flush=True)
                 self._proc = None
                 return
-            self._seg_id = self.index.open_segment(self.cam_id, self.zone, self.rec_dir)
             # Flush the pre-roll ring so the clip starts before the trigger (§9.2).
             for _ts, jpeg in list(self._ring):
                 self._feed(jpeg)
@@ -192,9 +191,6 @@ class Recorder:
                     proc.wait(timeout=2.0)
                 except Exception:  # noqa: BLE001
                     pass
-            if self._seg_id is not None:
-                self.index.close_segment(self._seg_id)
-                self._seg_id = None
 
     # ── frame intake ──────────────────────────────────────────────────────────
     def write_frame(self, jpeg: bytes) -> None:
