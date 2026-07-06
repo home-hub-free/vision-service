@@ -297,6 +297,39 @@ def match_poses_to_tracks(poses: List[Tuple[Keypoints, BBox]],
     return {tid: kps for tid, (kps, _iou) in best.items()}
 
 
+def assign_faces_to_tracks(faces: List[Tuple[List[float], BBox]],
+                           tracks: List[DetectedTrack]) -> dict:
+    """track_id → (embedding, face bbox), mutually exclusive.
+
+    Person boxes OVERLAP whenever two people share a room, so "the largest face
+    inside my track box" (the per-crop rule) routinely embeds the OTHER person's
+    closer/larger face — the direct mechanism behind A-labelled-as-B swaps. Ownership
+    here is containment-based instead: a face belongs to the track whose bbox contains
+    the face's center, and when several boxes do, the TIGHTEST (smallest-area) one wins
+    — the tighter person box is the body the face is actually attached to. One face per
+    track (largest wins — the near/frontal face over a background one); a face whose
+    center no track contains is dropped."""
+    def _area(b: BBox) -> int:
+        return max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+
+    claims: dict = {}  # track_id -> (face_area, emb, fbox)
+    for emb, fbox in faces:
+        cx, cy = (fbox[0] + fbox[2]) / 2.0, (fbox[1] + fbox[3]) / 2.0
+        owner, owner_area = None, 0
+        for t in tracks:
+            x1, y1, x2, y2 = t.bbox
+            if x1 <= cx <= x2 and y1 <= cy <= y2:
+                a = _area(t.bbox)
+                if owner is None or a < owner_area:
+                    owner, owner_area = t.track_id, a
+        if owner is None:
+            continue
+        fa = _area(fbox)
+        if owner not in claims or fa > claims[owner][0]:
+            claims[owner] = (fa, emb, fbox)
+    return {tid: (emb, fbox) for tid, (_fa, emb, fbox) in claims.items()}
+
+
 class NullPoseEngine:
     backend = "null"
 

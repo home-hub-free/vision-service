@@ -828,7 +828,32 @@ class Gallery:
         # member's gallery with the live embedding, letting the household centroid
         # converge on the look this camera actually sees.
         if promoted is not None:
-            if cfg.face_reinforce and cscore >= self._thr("face_reinforce_threshold"):
+            # The promotion may only speak (and teach) when the LIVE face isn't
+            # ambiguous BETWEEN members: the promoted member must beat every other
+            # member on this embedding by the match margin. Without this gate a
+            # wrongly-promoted or coin-flip cluster (centroid sitting between two
+            # members — verified live: clusters scoring 0.404-vs-0.406) stamps its
+            # member name on WHOEVER walks by, and the ungated reinforce below then
+            # folds person A's embedding into member B's centroid — the very
+            # cross-contamination that makes two members' centroids converge and
+            # their labels swap whenever they share a room. Note the promoted member
+            # does NOT need to clear the absolute match threshold (the whole point of
+            # the promoted path is the far/angled camera that never will); it only
+            # must not be in a dead heat with someone else.
+            own_emb = self._best_member_embedding(promoted)
+            own = _cosine(emb, own_emb) if own_emb is not None else None
+            o_uid, _o_name, o_score, _ = self._best_household(emb, exclude={promoted})
+            ambiguous = (own is not None and o_uid is not None
+                         and own - o_score < self._thr("face_match_margin"))
+            if ambiguous:
+                # Answer as an anonymous guest sighting — "someone is here", no name —
+                # instead of asserting a 50/50 identity. The 20s re-verify upgrades the
+                # label as soon as a frame reads decisively.
+                return Identity(id=gid, name=None, cls="guest",
+                                confidence=min(0.6, 0.3 + 0.05 * sightings))
+            if (cfg.face_reinforce and cscore >= self._thr("face_reinforce_threshold")
+                    and (own is None or o_uid is None
+                         or own - o_score >= self._thr("face_reinforce_margin"))):
                 self._reinforce_household(promoted, emb)
             return Identity(id=promoted, name=gname, cls="household",
                             confidence=_confidence(cscore, self._thr("guest_cluster_threshold")))

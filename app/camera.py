@@ -36,9 +36,9 @@ from .hub_client import Camera
 from .mjpeg import iter_jpeg_frames, multipart_chunk, open_stream
 from .rtsp import is_rtsp, iter_rtsp_frames, redact_url
 from .occupancy import Identity, Observation, UNKNOWN
-from .perception import (classify_posture, crop_jpeg, decode_jpeg, draw_overlay,
-                         face_crop_jpeg, make_detector, make_face_engine,
-                         make_pose_engine, match_poses_to_tracks)
+from .perception import (assign_faces_to_tracks, classify_posture, crop_jpeg,
+                         decode_jpeg, draw_overlay, face_crop_jpeg, make_detector,
+                         make_face_engine, make_pose_engine, match_poses_to_tracks)
 from .recorder import Recorder
 from .state import gallery, index, tracker
 
@@ -239,13 +239,24 @@ class CameraWorker(threading.Thread):
                     posture = classify_posture(kps, tbox)
                     if posture:
                         postures[tid] = posture
-        labels: Dict[str, str] = {}
-        observations: List[Observation] = []
+        # Which tracks need a fresh embedding this frame: `resolve` = no identity yet
+        # (embed once per track, then re-try only while still unknown); `recheck` = the
+        # periodic household re-verify that heals tracker id-switches.
+        need: Dict[str, str] = {}
         for t in tracks:
             ident = self._idents.get(t.track_id)
-            # Embed + resolve once per track, then re-try only while still unknown.
             if ident is None or ident.cls == "unknown":
-                emb, thumb, thumb_box = self._embed_track(frame, t.bbox)
+                need[t.track_id] = "resolve"
+            elif (cfg.face_reverify_s > 0 and ident.cls == "household"
+                  and now - self._ident_ts.get(t.track_id, 0.0) >= cfg.face_reverify_s):
+                need[t.track_id] = "recheck"
+        embeds = self._embed_tracks(frame, tracks, need)
+        idents: Dict[str, Identity] = {}
+        for t in tracks:
+            ident = self._idents.get(t.track_id)
+            mode = need.get(t.track_id)
+            if mode == "resolve":
+                emb, thumb, thumb_box = embeds.get(t.track_id, (None, None, None))
                 if emb is not None:
                     try:
                         ident = gallery.resolve(emb, thumb or crop_jpeg(frame, t.bbox),
@@ -259,15 +270,14 @@ class CameraWorker(threading.Thread):
                     ident = ident or UNKNOWN
                 self._idents[t.track_id] = ident
                 self._ident_ts[t.track_id] = now
-            elif (cfg.face_reverify_s > 0 and ident.cls == "household"
-                  and now - self._ident_ts.get(t.track_id, 0.0) >= cfg.face_reverify_s):
+            elif mode == "recheck":
                 # Heal tracker id-switches: when two people cross, ByteTrack can swap
                 # their track ids — each then wears the OTHER's cached label for the
                 # track's whole life. Periodically re-embed and, only on a decisive
                 # fresh match (recheck is side-effect-free and margin-gated), replace
                 # the cached identity. An indecisive frame keeps the cached label.
                 self._ident_ts[t.track_id] = now  # pace re-checks even when indecisive
-                emb, _, _ = self._embed_track(frame, t.bbox)
+                emb, _, _ = embeds.get(t.track_id, (None, None, None))
                 fresh = None
                 if emb is not None:
                     try:
@@ -280,6 +290,12 @@ class CameraWorker(threading.Thread):
                           f"(id-switch heal)", flush=True)
                     ident = fresh
                     self._idents[t.track_id] = fresh
+            idents[t.track_id] = ident
+        self._dedupe_household(idents)
+        labels: Dict[str, str] = {}
+        observations: List[Observation] = []
+        for t in tracks:
+            ident = idents[t.track_id]
             observations.append(Observation(track_id=t.track_id, identity=ident,
                                             bbox=t.bbox, frame_w=frame_w,
                                             posture=postures.get(t.track_id),
@@ -325,6 +341,55 @@ class CameraWorker(threading.Thread):
         if not cfg.detect_on_motion or not self.events_attached:
             return True
         return self.motion_active or (now - self.last_motion_ts) < cfg.motion_linger_s
+
+    def _embed_tracks(self, frame, tracks, wanted) -> Dict[str, tuple]:
+        """(emb, thumb, thumb_box) per wanted track id. With ONE person in frame the
+        per-crop path (`_embed_track`) stands; with SEVERAL, faces are detected once at
+        frame level and assigned to tracks EXCLUSIVELY by containment
+        (`assign_faces_to_tracks`) — the per-crop "largest face in my box" rule embeds
+        the other person's face when person boxes overlap, which is how two people in
+        one room end up wearing each other's names."""
+        out: Dict[str, tuple] = {}
+        if not wanted:
+            return out
+        if len(tracks) > 1 and hasattr(self.face, "faces"):
+            min_px = max(0, cfg.face_min_px)
+            faces = [(emb, box) for emb, box in self.face.faces(frame)
+                     if not min_px or max(box[2] - box[0], box[3] - box[1]) >= min_px]
+            assigned = assign_faces_to_tracks(faces, tracks)
+            for tid in wanted:
+                hit = assigned.get(tid)
+                if hit is None:
+                    out[tid] = (None, None, None)
+                    continue
+                emb, fbox = hit
+                packed = face_crop_jpeg(frame, fbox)
+                thumb, thumb_box = packed if packed is not None else (None, None)
+                out[tid] = (emb, thumb, thumb_box)
+            return out
+        for t in tracks:
+            if t.track_id in wanted:
+                out[t.track_id] = self._embed_track(frame, t.bbox)
+        return out
+
+    def _dedupe_household(self, idents: Dict[str, Identity]) -> None:
+        """One member cannot be two people in one frame: when several live tracks carry
+        the SAME household id, keep the highest-confidence one and reset the rest to
+        unknown (dropped from the cache too, so they re-embed next frame — with
+        exclusive face assignment the retry converges on the right person instead of
+        ping-ponging)."""
+        by_member: Dict[str, List[str]] = {}
+        for tid, ident in idents.items():
+            if ident is not None and ident.cls == "household" and ident.id:
+                by_member.setdefault(ident.id, []).append(tid)
+        for tids in by_member.values():
+            if len(tids) < 2:
+                continue
+            tids.sort(key=lambda tid: idents[tid].confidence, reverse=True)
+            for tid in tids[1:]:
+                idents[tid] = UNKNOWN
+                self._idents.pop(tid, None)
+                self._ident_ts.pop(tid, None)
 
     def _embed_track(self, frame, bbox):
         """(embedding, thumb, thumb_box) for one track's person box.
