@@ -10,6 +10,14 @@ per-camera track observations into:
     person_left / room_empty — the wake-worthy events, fired ONCE per arrival with a
     re-arm cooldown so a lingering or flickering person never re-wakes the agent.
 
+Edges are debounced at the PERSON level via the presence ledger (`_Presence`):
+tracks flap (a detector dropout on a seated person kills one and a re-detection
+mints another 30–170s later — measured live 2026-07-06), people don't. A vanished
+person goes silently pending for `leave_confirm_s` before ONE truthful person_left
+(stamped with when they were last seen); returns inside the window heal with zero
+edges; unresolved new arrivals hold their entered edge for `identify_settle_s` so
+a flap-heal or a short-lived false detection never wakes anyone at all.
+
 It is pure over an injected clock (`now`), with no I/O, so the debounce/hysteresis
 is unit-testable without cameras or models (see ../tests/test_occupancy.py). The
 camera worker feeds it; the MQTT producer publishes whatever edges it returns.
@@ -123,6 +131,37 @@ class Edge:
     ts: float
 
 
+@dataclass
+class _Presence:
+    """One PERSON in one zone — the ledger entry the edges are debounced against.
+
+    Tracks are ephemeral (a detector dropout kills one and a re-detection mints a
+    fresh id); a person is not. `tracks` is the set of live track keys currently
+    supporting this entry (several cameras / a re-formed track all land on the same
+    entry via the identity key), and presence survives track churn:
+      * lose the last supporting track → `pending_left_since` starts ticking, the
+        entry stays in the snapshot (a dropout must not flap the dashboard/agent);
+      * a track re-appears inside `leave_confirm_s` → healed, ZERO edges;
+      * absence outlives the window → ONE person_left, stamped with `last_seen`
+        (when they actually disappeared, not when we gave up waiting).
+    `announced` = the entered edge was emitted (or deliberately suppressed by the
+    rewake cooldown); an entry that dies unannounced was a blip — total silence.
+    """
+    zone: str
+    key: str                     # identity key ("u1" | "guest:3" | "unknown:<track>")
+    identity: Identity
+    first_seen: float
+    last_seen: float
+    tracks: set
+    announced: bool = False
+    hold_until: float = 0.0      # identify-settle deadline for unresolved entries
+    pending_left_since: Optional[float] = None
+    last_cam: str = ""
+    last_track_key: str = ""
+    last_posture: Optional[str] = None
+    last_context: bool = True
+
+
 class OccupancyTracker:
     """Holds live per-zone state and turns observations into salient edges.
 
@@ -130,13 +169,23 @@ class OccupancyTracker:
     only ever monotonically improves on a track (a higher-confidence read wins, and
     unknown→known is an upgrade); we never downgrade a known person to unknown on a
     frame where the face simply wasn't visible.
+
+    Edges are emitted from the PRESENCE LEDGER (identity-level), never straight from
+    track lifecycle: a detector losing a seated person for 30–170s (measured live
+    2026-07-06 — ~700 false enter/leave edges in 6h) re-forms a new track, but the
+    ledger just heals the same person. Named people key by their id (so two cameras
+    seeing David in one zone = ONE person); unresolved people key per track but
+    ADOPT a pending unknown in the zone (a re-detected stranger is presumed to be
+    the stranger who just "vanished", so their flaps heal too — while two
+    simultaneous strangers still count as two).
     """
 
     def __init__(self) -> None:
         self._tracks: Dict[str, _Track] = {}
-        # Per-zone re-arm memory: identity-key -> ts it last left. A re-entry inside
-        # rewake_cooldown_s is treated as a continuation (no new wake), so a person
-        # pacing in/out of frame doesn't spam person_entered.
+        # The presence ledger: (zone, identity-key) -> _Presence.
+        self._presence: Dict[Tuple[str, str], _Presence] = {}
+        # Per-zone re-arm memory: identity-key -> ts it last (confirmed) left. A
+        # re-entry inside rewake_cooldown_s is a continuation (no new wake).
         self._recent_left: Dict[str, Dict[str, float]] = {}
         self._zone_occupied: Dict[str, bool] = {}
 
@@ -171,47 +220,180 @@ class OccupancyTracker:
             if alert is not None:
                 edges.append(alert)
 
-            # Cross to "present" after enter_frames consecutive sightings (debounce).
+            # Cross to "present" after enter_frames consecutive sightings (debounce),
+            # then keep the track registered in the ledger; a resolved/improved
+            # identity re-registers under the person's real key.
             if not tr.present and tr.hits >= cfg.enter_frames:
                 tr.present = True
-                # Mark the identity announced REGARDLESS of suppression, so a
-                # cooldown-suppressed re-entry also stays quiet on the next frame
-                # (otherwise the identify-after-present branch would re-fire it).
-                tr.announced_identity = tr.identity.key()
-                if not self._suppressed_by_cooldown(zone, tr.identity, now):
-                    edges.append(self._mk(EDGE_ENTERED, tr, now))
-                    if tr.identity.cls != "unknown":
-                        edges.append(self._identify_edge(tr, now))
+                tr.announced_identity = self._register(tr, edges, now)
+            elif tr.present:
+                want = self._ledger_key(tr)
+                if tr.announced_identity != want:
+                    continued = self._unregister_for_upgrade(tr)
+                    tr.announced_identity = self._register(tr, edges, now, continued)
+                else:
+                    self._refresh(tr, now)
 
-            # Identity arrived/improved AFTER we already announced presence.
-            elif tr.present and tr.identity.cls != "unknown" and tr.announced_identity != tr.identity.key():
-                tr.announced_identity = tr.identity.key()
-                edges.append(self._identify_edge(tr, now))
+        self._expire(cam_id, zone, seen_keys, now)
+        edges += self._sweep(now)
+        return edges
 
-        edges += self._expire(cam_id, zone, seen_keys, now)
-        self._recompute_zone(zone, now, edges)
+    # ── the presence ledger ───────────────────────────────────────────────────
+    def _ledger_key(self, tr: _Track) -> str:
+        # Unresolved people can't be matched by identity, so they key per track —
+        # adoption (below) is what heals their flaps.
+        return tr.identity.key() if tr.identity.id else f"unknown:{tr.key}"
+
+    def _register(self, tr: _Track, edges: List[Edge], now: float,
+                  continued: Optional[_Presence] = None) -> str:
+        """Attach a present track to its person's ledger entry (creating/healing/
+        adopting as needed). `continued` is the entry this track just vacated on an
+        identity upgrade — the SAME person under a better key, so its announcement
+        and arrival time carry over (an upgrade emits identified, never a second
+        entered). Returns the ledger key the track now supports."""
+        key = self._ledger_key(tr)
+        entry = self._presence.get((tr.zone, key))
+
+        # Adoption: a NEW unresolved track in a zone where an unresolved person is
+        # pending-left is presumed to be that same person re-detected.
+        if entry is None and not tr.identity.id:
+            adopted = self._oldest_pending_unknown(tr.zone)
+            if adopted is not None:
+                del self._presence[(adopted.zone, adopted.key)]
+                adopted.key = key
+                self._presence[(tr.zone, key)] = adopted
+                entry = adopted
+
+        if entry is not None:
+            entry.tracks.add(tr.key)
+            entry.pending_left_since = None  # heal — they never really left
+            self._touch(entry, tr, now)
+            return key
+
+        entry = _Presence(zone=tr.zone, key=key, identity=tr.identity,
+                          first_seen=now, last_seen=now, tracks={tr.key},
+                          hold_until=(now + cfg.identify_settle_s
+                                      if tr.identity.cls == "unknown" else now))
+        self._presence[(tr.zone, key)] = entry
+        self._touch(entry, tr, now)
+        # A named person turning up HERE confirms any pending leave elsewhere at
+        # once — the move between rooms should read entered+left, promptly.
+        if tr.identity.id:
+            edges.extend(self._confirm_elsewhere(key, tr.zone, now))
+        if continued is not None and continued.announced:
+            # Continuation of an already-announced person: keep their arrival time,
+            # skip entered, and announce only what's NEW — the identity.
+            entry.announced = True
+            entry.first_seen = continued.first_seen
+            if entry.identity.cls != "unknown":
+                edges.append(self._identify_edge(entry, now))
+            return key
+        self._try_announce(entry, edges, now)
+        return key
+
+    def _unregister_for_upgrade(self, tr: _Track) -> Optional[_Presence]:
+        """A present track re-keyed (unknown→named, guest→member, id-switch heal):
+        move its support silently. An emptied entry is a CONTINUATION of the same
+        person under the new key, so it dies without a left edge — never a phantom
+        second person lingering in the count. Returns the vacated entry so the
+        re-registration can inherit its announcement + arrival time."""
+        old = self._presence.get((tr.zone, tr.announced_identity or ""))
+        if old is None:
+            return None
+        old.tracks.discard(tr.key)
+        if not old.tracks:
+            del self._presence[(old.zone, old.key)]
+            return old
+        return None
+
+    def _refresh(self, tr: _Track, now: float) -> None:
+        entry = self._presence.get((tr.zone, tr.announced_identity or ""))
+        if entry is not None:
+            entry.tracks.add(tr.key)
+            entry.pending_left_since = None
+            self._touch(entry, tr, now)
+
+    def _touch(self, entry: _Presence, tr: _Track, now: float) -> None:
+        entry.last_seen = now
+        entry.identity = _better(entry.identity, tr.identity)
+        entry.last_cam = tr.cam_id
+        entry.last_track_key = tr.key
+        entry.last_posture = tr.posture
+        entry.last_context = tr.context
+
+    def _try_announce(self, entry: _Presence, edges: List[Edge], now: float) -> None:
+        if entry.announced or now < entry.hold_until or not entry.tracks:
+            return
+        entry.announced = True  # set even when suppressed — stay quiet afterwards
+        if self._suppressed_by_cooldown(entry.zone, entry.identity, now):
+            return
+        edges.append(self._mk_presence(EDGE_ENTERED, entry, now))
+        if entry.identity.cls != "unknown":
+            edges.append(self._identify_edge(entry, now))
+
+    def _oldest_pending_unknown(self, zone: str) -> Optional[_Presence]:
+        candidates = [e for e in self._presence.values()
+                      if e.zone == zone and e.pending_left_since is not None
+                      and not e.identity.id]
+        return min(candidates, key=lambda e: e.pending_left_since) if candidates else None
+
+    def _confirm_elsewhere(self, key: str, except_zone: str, now: float) -> List[Edge]:
+        edges: List[Edge] = []
+        for (zone, k), entry in list(self._presence.items()):
+            if k == key and zone != except_zone and entry.pending_left_since is not None:
+                edges.extend(self._confirm_left(entry, now))
         return edges
 
     # ── leave / empty ───────────────────────────────────────────────────────
-    def _expire(self, cam_id: str, zone: str, seen_keys: set, now: float) -> List[Edge]:
-        edges: List[Edge] = []
+    def _expire(self, cam_id: str, zone: str, seen_keys: set, now: float) -> None:
+        """Tracks that stopped being observed age out after leave_grace_s — but only
+        their LEDGER entry reacts (pending-left), never a direct edge."""
         for key, tr in list(self._tracks.items()):
             if tr.cam_id != cam_id or tr.zone != zone or key in seen_keys:
                 continue
             if now - tr.last_seen <= cfg.leave_grace_s:
                 continue
-            if tr.present:
-                edges.append(self._mk(EDGE_LEFT, tr, now))
-                self._recent_left.setdefault(zone, {})[tr.identity.key()] = now
+            entry = self._presence.get((tr.zone, tr.announced_identity or ""))
+            if entry is not None:
+                entry.tracks.discard(tr.key)
+                if not entry.tracks:
+                    if entry.announced:
+                        entry.pending_left_since = now
+                        entry.last_seen = tr.last_seen  # when they actually vanished
+                    else:
+                        # A blip that died before it settled — total silence.
+                        del self._presence[(entry.zone, entry.key)]
             del self._tracks[key]
+
+    def _sweep(self, now: float) -> List[Edge]:
+        """Ledger heartbeat, run on every update (any camera): announce entries
+        whose identify-settle expired, confirm leaves whose window ran out, and
+        derive room_empty from the ledger."""
+        edges: List[Edge] = []
+        for entry in list(self._presence.values()):
+            if not entry.announced and entry.tracks:
+                self._try_announce(entry, edges, now)
+            if entry.pending_left_since is not None and \
+                    now - entry.pending_left_since >= cfg.leave_confirm_s:
+                edges.extend(self._confirm_left(entry, now))
+        self._recompute_zones(edges, now)
         return edges
 
-    def _recompute_zone(self, zone: str, now: float, edges: List[Edge]) -> None:
-        occupied = any(t.present for t in self._tracks.values() if t.zone == zone)
-        was = self._zone_occupied.get(zone, False)
-        if was and not occupied:
-            edges.append(Edge(EDGE_ROOM_EMPTY, zone, "", "", UNKNOWN, now))
-        self._zone_occupied[zone] = occupied
+    def _confirm_left(self, entry: _Presence, now: float) -> List[Edge]:
+        del self._presence[(entry.zone, entry.key)]
+        if not entry.announced:
+            return []
+        self._recent_left.setdefault(entry.zone, {})[entry.identity.key()] = now
+        # ts = when they were last SEEN — the truthful departure moment — not the
+        # (leave_confirm_s later) moment we stopped waiting for them.
+        return [self._mk_presence(EDGE_LEFT, entry, entry.last_seen)]
+
+    def _recompute_zones(self, edges: List[Edge], now: float) -> None:
+        occupied_zones = {e.zone for e in self._presence.values() if e.announced}
+        for zone, was in list(self._zone_occupied.items()):
+            if was and zone not in occupied_zones:
+                edges.append(Edge(EDGE_ROOM_EMPTY, zone, "", "", UNKNOWN, now))
+        self._zone_occupied = {z: True for z in occupied_zones}
 
     # ── T0 dwell/speed + T1 posture alert ─────────────────────────────────────
     def _update_motion(self, tr: _Track, obs: Observation, now: float) -> None:
@@ -263,9 +445,13 @@ class OccupancyTracker:
         return self._mk(EDGE_POSTURE_ALERT, tr, now)
 
     # ── helpers ───────────────────────────────────────────────────────────────
-    def _identify_edge(self, tr: _Track, now: float) -> Edge:
-        edge = EDGE_GUEST_ARRIVED if tr.identity.cls == "guest" else EDGE_IDENTIFIED
-        return self._mk(edge, tr, now)
+    def _identify_edge(self, entry: _Presence, now: float) -> Edge:
+        edge = EDGE_GUEST_ARRIVED if entry.identity.cls == "guest" else EDGE_IDENTIFIED
+        return self._mk_presence(edge, entry, now)
+
+    def _mk_presence(self, edge: str, entry: _Presence, ts: float) -> Edge:
+        return Edge(edge=edge, zone=entry.zone, cam_id=entry.last_cam,
+                    track_key=entry.last_track_key, identity=entry.identity, ts=ts)
 
     def _mk(self, edge: str, tr: _Track, now: float) -> Edge:
         return Edge(edge=edge, zone=tr.zone, cam_id=tr.cam_id, track_key=tr.key,
@@ -278,45 +464,61 @@ class OccupancyTracker:
     # ── privacy withdrawal ────────────────────────────────────────────────────
     def drop_camera(self, cam_id: str) -> None:
         """Withdraw one camera's observations SILENTLY (privacy mode): its tracks
-        vanish from the snapshot without emitting left/room-empty edges — the people
-        may well still be there, the camera just stopped looking, so fabricating
-        `person_left` events would poison memory. Downstream (the hub's rooms model)
-        goes stale-then-unknown via its vision TTL, which is the honest signal."""
-        zones = set()
+        AND the ledger entries only they supported vanish from the snapshot without
+        emitting left/room-empty edges — the people may well still be there, the
+        camera just stopped looking, so fabricating `person_left` events would
+        poison memory. Downstream (the hub's rooms model) goes stale-then-unknown
+        via its vision TTL, which is the honest signal. Entries a second camera
+        still supports stay."""
+        dead = set()
         for key, tr in list(self._tracks.items()):
             if tr.cam_id != cam_id:
                 continue
-            zones.add(tr.zone)
+            dead.add(key)
             del self._tracks[key]
-        for zone in zones:
-            self._zone_occupied[zone] = any(
-                t.present for t in self._tracks.values() if t.zone == zone)
+        for pkey, entry in list(self._presence.items()):
+            supported_here = bool(entry.tracks & dead)
+            entry.tracks -= dead
+            if supported_here and not entry.tracks:
+                del self._presence[pkey]
+        self._zone_occupied = {
+            z: True for z in {e.zone for e in self._presence.values() if e.announced}}
 
     # ── snapshot (pull surface — who_is_here) ─────────────────────────────────
     def snapshot(self, zone: Optional[str] = None, now: Optional[float] = None) -> dict:
+        """Read from the LEDGER, not the tracks: a person mid-dropout (pending-left,
+        no live track) is still shown — presence that flapped Empty↔David on every
+        detector hiccup was the dashboard/agent symptom this fixes. Activity fields
+        come from the best live supporting track; a ghost keeps its last posture and
+        reads as not moving."""
         now = time.time() if now is None else now
         out: Dict[str, list] = {}
-        for tr in self._tracks.values():
-            if not tr.present:
+        for entry in self._presence.values():
+            if zone and entry.zone != zone:
                 continue
-            if zone and tr.zone != zone:
-                continue
-            entry = {
-                "track": tr.key,
-                "since": tr.first_seen,
-                **tr.identity.as_meta(),
+            tr = self._best_track(entry)
+            item = {
+                "track": tr.key if tr else entry.last_track_key,
+                "since": entry.first_seen,
+                **entry.identity.as_meta(),
             }
-            if tr.context:
+            context = tr.context if tr else entry.last_context
+            if context:
                 # T0 activity signals (§2): how long they've been here + whether they're
                 # in motion right now (speed EMA vs the passing bar, camera-agnostic).
                 # Identity-only tracks (satellite cams) omit ALL context fields, which is
                 # what keeps them out of zone activity + T2a hints downstream.
-                entry["dwell_s"] = round(max(0.0, now - tr.first_seen), 1)
-                entry["moving"] = tr.speed >= cfg.activity_speed_fws
-                if tr.posture:
-                    entry["posture"] = tr.posture  # T1 (§3), only once a pose engine read it
-            out.setdefault(tr.zone, []).append(entry)
+                item["dwell_s"] = round(max(0.0, now - entry.first_seen), 1)
+                item["moving"] = bool(tr and tr.speed >= cfg.activity_speed_fws)
+                posture = tr.posture if tr else entry.last_posture
+                if posture:
+                    item["posture"] = posture  # T1 (§3), only once a pose engine read it
+            out.setdefault(entry.zone, []).append(item)
         return out
+
+    def _best_track(self, entry: _Presence) -> Optional[_Track]:
+        live = [self._tracks[k] for k in entry.tracks if k in self._tracks]
+        return max(live, key=lambda t: t.last_seen) if live else None
 
     def who_is_here(self, zone: Optional[str] = None) -> List[dict]:
         snap = self.snapshot(zone)

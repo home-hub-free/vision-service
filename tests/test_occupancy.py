@@ -1,8 +1,24 @@
-"""Occupancy debounce / salience edges — the §8 push-vs-pull behaviour, no models."""
+"""Occupancy debounce / salience edges — the §8 push-vs-pull behaviour, no models.
+
+These cases run with the identity-level hysteresis knobs at ZERO (leave confirms
+instantly, unknowns announce instantly) — i.e. the classic per-track timing. The
+ledger behaviour itself (flap healing, settle, truthful lefts) is pinned in
+test_occupancy_hysteresis.py.
+"""
+import pytest
+
 from app.config import cfg
 from app.occupancy import (EDGE_ENTERED, EDGE_GUEST_ARRIVED, EDGE_IDENTIFIED,
                            EDGE_LEFT, EDGE_POSTURE_ALERT, EDGE_ROOM_EMPTY,
                            Identity, Observation, OccupancyTracker)
+
+
+@pytest.fixture(autouse=True)
+def instant_hysteresis():
+    old = cfg.leave_confirm_s, cfg.identify_settle_s
+    cfg.leave_confirm_s, cfg.identify_settle_s = 0.0, 0.0
+    yield
+    cfg.leave_confirm_s, cfg.identify_settle_s = old
 
 
 def _household():

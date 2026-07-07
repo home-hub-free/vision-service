@@ -121,12 +121,14 @@ def test_stream_and_snapshot_refuse_while_private(fake_workers):
 
 def test_drop_camera_withdraws_tracks_silently():
     trk = OccupancyTracker()
-    ident = Identity(cls="household", id="u1", name="David", confidence=0.9)
+    david = Identity(cls="household", id="u1", name="David", confidence=0.9)
+    ana = Identity(cls="household", id="u2", name="Ana", confidence=0.9)
     now = time.time()
-    # enough consecutive sightings to cross "present" on both cameras
+    # enough consecutive sightings to cross "present" on both cameras (one person
+    # per camera — the ledger dedupes the SAME person across cameras to one entry)
     for i in range(5):
-        trk.update("camA", "sala", [Observation("t1", ident)], now + i)
-        trk.update("camB", "sala", [Observation("t2", ident)], now + i)
+        trk.update("camA", "sala", [Observation("t1", david)], now + i)
+        trk.update("camB", "sala", [Observation("t2", ana)], now + i)
     assert len(trk.snapshot("sala").get("sala", [])) == 2
 
     trk.drop_camera("camA")

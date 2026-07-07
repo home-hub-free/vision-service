@@ -205,8 +205,18 @@ class Config:
 
     # ── occupancy debounce (§4.3 / §8 — fire once per arrival, not per frame) ─
     enter_frames: int = field(default_factory=lambda: _i("VISION_ENTER_FRAMES", 3))   # consecutive hits → present
-    leave_grace_s: float = field(default_factory=lambda: _f("VISION_LEAVE_GRACE_S", 6.0))  # gone this long → left
+    leave_grace_s: float = field(default_factory=lambda: _f("VISION_LEAVE_GRACE_S", 6.0))  # gone this long → track expires
     rewake_cooldown_s: float = field(default_factory=lambda: _f("VISION_REWAKE_COOLDOWN_S", 30.0))  # re-arm window
+    # Identity-level hysteresis (the presence LEDGER — see occupancy.py). Measured
+    # 2026-07-06: detector dropouts on seated people re-formed tracks 30–170s later,
+    # emitting ~700 false enter/leave edges in 6h. `leave_confirm_s`: a vanished
+    # person goes pending-left silently and person_left only emits after this much
+    # continuous absence (a return inside the window heals with ZERO edges; 0 = old
+    # per-track behaviour). `identify_settle_s`: a NEW unresolved (unknown) presence
+    # holds its entered edge this long so the face can resolve first — a flap-heal or
+    # a short-lived detection blip then never wakes anyone (0 = announce instantly).
+    leave_confirm_s: float = field(default_factory=lambda: _f("VISION_LEAVE_CONFIRM_S", 120.0))
+    identify_settle_s: float = field(default_factory=lambda: _f("VISION_IDENTIFY_SETTLE_S", 8.0))
 
     # ── recording (§9) ───────────────────────────────────────────────────────
     # mode: "off" | "continuous" | "gated" | "hybrid" (§9.2; hybrid is the rec default).
