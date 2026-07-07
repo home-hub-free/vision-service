@@ -79,6 +79,7 @@ def test_small_face_upgraded_from_one_highres_frame():
 
 def test_large_face_never_triggers_sampler():
     cfg.highres_min_face_px = 30             # 40px lo face is now "big enough"
+    cfg.face_min_px = 30                     # keep the identity floor consistent
     w = _worker()
     w.highres = _FakeSampler(frame=HI)
     out = w._embed_tracks(LO, [DetectedTrack(track_id="a", bbox=(0, 0, 100, 200))],
@@ -93,6 +94,7 @@ def test_rate_limited_resolve_holds_back_noisy_embedding():
     far-face cluster. A RECHECK keeps its substream embedding path (an indecisive
     recheck is already a no-op)."""
     cfg.highres_min_face_px = 90
+    cfg.face_min_px = 0                      # this test is about rate-limit mechanics
     w = _worker()
     w.highres = _FakeSampler(frame=None, degraded=False)
     tracks = [DetectedTrack(track_id="a", bbox=(0, 0, 100, 200))]
@@ -103,14 +105,41 @@ def test_rate_limited_resolve_holds_back_noisy_embedding():
 
 
 def test_degraded_sampler_passes_substream_through():
-    """A broken high-res source (session cap, camera quirk) must never starve
-    recognition: degraded → the substream embedding is used as before."""
+    """A broken high-res source (session cap, camera quirk) must never starve the
+    pipeline: degraded → the substream embedding passes through the SAMPLER
+    unchanged. The identity size floor is a separate, later gate (next test)."""
     cfg.highres_min_face_px = 90
+    cfg.face_min_px = 0
     w = _worker()
     w.highres = _FakeSampler(frame=None, degraded=True)
     out = w._embed_tracks(LO, [DetectedTrack(track_id="a", bbox=(0, 0, 100, 200))],
                           {"a": "resolve"})
     assert out["a"][0] == [0.1] * 4
+
+
+def test_identity_floor_applies_after_rescue():
+    """face_min_px is enforced AFTER the high-res rescue had its shot: a face the
+    rescue could not lift past the floor abstains from identity entirely (no noise
+    embedding reaches the gallery), while a successful rescue sails past it."""
+    cfg.highres_min_face_px = 90
+    cfg.face_min_px = 72
+    tracks = [DetectedTrack(track_id="a", bbox=(0, 0, 100, 200))]
+    # rescue unavailable (degraded): the 40px substream face is floored → abstain
+    w = _worker()
+    w.highres = _FakeSampler(frame=None, degraded=True)
+    out = w._embed_tracks(LO, tracks, {"a": "resolve"})
+    assert out["a"] == (None, None, None)
+    # rescue works: the 160px hi-frame face clears the floor and is used
+    w = _worker()
+    w.highres = _FakeSampler(frame=HI)
+    out = w._embed_tracks(LO, tracks, {"a": "resolve"})
+    assert out["a"][0] == [0.9] * 4
+    # no sampler at all (single-stream cam): the floor still guards identity
+    w = _worker()
+    w.highres = None
+    out = w._embed_tracks(LO, tracks, {"a": "resolve"})
+    assert out["a"] == (None, None, None)
+    cfg.face_min_px = 0  # leave the global permissive for unrelated tests
 
 
 def test_sampler_rate_limit_and_degrade_then_selfheal():

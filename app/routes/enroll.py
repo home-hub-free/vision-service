@@ -135,15 +135,31 @@ def thumb(label_id: str):
                     headers={"Cache-Control": "no-cache"})
 
 
+# Why an enrollment photo was refused → what the guided flow tells the user to DO
+# about it. Enrollment samples are the anchors every identity decision leans on, so
+# refusing junk here (instead of politely folding it in) is the whole ballgame —
+# the 2026-07-07 pollution started with profile-view 87px enroll frames.
+_ENROLL_REJECTIONS = {
+    "no_face": "I can't see a face in that shot — center your face in the oval.",
+    "multiple_faces": "I see more than one face — enroll one person at a time.",
+    "too_small": "Your face is too small in the frame — move closer to the camera.",
+    "off_angle": "Face the camera straight on for this one.",
+    "blurry": "That one came out blurry — hold still and try again.",
+    "low_confidence": "I can't read your face clearly — try facing the camera in better light.",
+}
+
+
 @router.post("/faces/enroll")
 async def enroll(image: UploadFile = File(...), authorization: Optional[str] = Header(None)):
     user = user_from_token(authorization)  # enroll for the AUTHENTICATED user only
     data = await image.read()
     if not data:
         raise HTTPException(status_code=400, detail="empty image upload")
-    emb = enroll_embedding(data)
+    emb, reason = enroll_embedding(data)
     if emb is None:
-        raise HTTPException(status_code=422, detail="no face detected in image")
+        raise HTTPException(status_code=422,
+                            detail=_ENROLL_REJECTIONS.get(reason or "no_face",
+                                                          _ENROLL_REJECTIONS["no_face"]))
     # Store a downscaled copy of the enroll image as the member's face thumbnail, so the
     # dashboard People roster shows their face beside their name.
     samples = gallery.enroll(user["id"], user.get("displayName") or user.get("name"),

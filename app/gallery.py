@@ -597,12 +597,30 @@ class Gallery:
         conn = self._db()
         try:
             people: List[dict] = []
+            seen_members = set()
             for uid, name, samples, has_thumb in conn.execute(
                 "SELECT user_id, name, samples, thumb IS NOT NULL FROM faces ORDER BY updated_at DESC"
             ):
+                seen_members.add(uid)
                 people.append({
                     "id": uid, "label": name or uid, "name": name, "class": "household",
                     "samples": samples, "has_thumb": bool(has_thumb), "named": name is not None,
+                })
+            # A member the gallery knows ONLY through promoted clusters (promotion no
+            # longer seeds a faces row — see promote_guest): still a recognizable
+            # household identity, so the roster shows them; samples=0 says "not
+            # enrolled yet" honestly.
+            for uid, name, has_thumb in conn.execute(
+                """SELECT promoted_user_id, MAX(name), MAX(thumb IS NOT NULL)
+                   FROM guests WHERE promoted_user_id IS NOT NULL
+                     AND promoted_user_id NOT LIKE 'guest:%'
+                   GROUP BY promoted_user_id"""
+            ):
+                if uid in seen_members:
+                    continue
+                people.append({
+                    "id": uid, "label": name or uid, "name": name, "class": "household",
+                    "samples": 0, "has_thumb": bool(has_thumb), "named": name is not None,
                 })
             for gid, name, sightings, last_seen, promoted, has_thumb in conn.execute(
                 """SELECT guest_id, name, sightings, last_seen, promoted_user_id, thumb IS NOT NULL
@@ -625,21 +643,40 @@ class Gallery:
         try:
             table, col = ("guests", "guest_id") if label_id.startswith("guest:") else ("faces", "user_id")
             row = conn.execute(f"SELECT thumb FROM {table} WHERE {col}=?", (label_id,)).fetchone()
-            return row[0] if row and row[0] is not None else None
+            if row and row[0] is not None:
+                return row[0]
+            if not label_id.startswith("guest:"):
+                # Member without an enroll portrait: lend the face from their most
+                # recently seen promoted cluster (promotion no longer copies thumbs
+                # into the profile — the cluster keeps owning its crop).
+                row = conn.execute(
+                    """SELECT thumb FROM guests WHERE promoted_user_id=? AND thumb IS NOT NULL
+                       ORDER BY last_seen DESC LIMIT 1""", (label_id,)).fetchone()
+                return row[0] if row else None
+            return None
         finally:
             conn.close()
 
     def promote_guest(self, guest_id: str, user_id: str, name: Optional[str],
                       carry_thumb: bool = True) -> bool:
-        """Promote a recurring guest cluster into a named household member's gallery:
-        its centroid seeds (or merges into) the user's face profile, and the guest row
-        is tagged promoted so it stops surfacing for review. `carry_thumb=False` keeps
-        the member's deliberate enroll portrait (auto-heal must not swap it for a
-        random low-angle crop)."""
+        """Promote a guest cluster into a household member — a ROUTING decision only:
+        the cluster is tagged promoted (it stops surfacing for review, and resolve
+        answers as that member on a cluster match), but it NEVER folds into the
+        member's face profile. It used to (via enroll's running mean, full weight,
+        no gate) — and that was the pollution engine of 2026-07-07: ~110 mostly
+        single-sighting clusters auto-healed in a day, each dumping a junk embedding
+        into a member centroid until two members read cos 0.702 apart and swapped
+        names. The member's profile is built from enrollment anchors alone; a
+        promoted cluster contributes recognition coverage (far/angled cameras) from
+        its OWN centroid. The faces table is never written here at all — a member
+        with no enroll portrait borrows a promoted cluster's crop at read time
+        (get_thumb), so `carry_thumb` no longer copies anything (kept for caller
+        compatibility)."""
+        del carry_thumb  # thumb lending moved to get_thumb (read time)
         with _lock:
             conn = self._db()
             try:
-                row = conn.execute("SELECT embedding, thumb FROM guests WHERE guest_id=?", (guest_id,)).fetchone()
+                row = conn.execute("SELECT guest_id FROM guests WHERE guest_id=?", (guest_id,)).fetchone()
                 if not row:
                     return False
                 conn.execute("UPDATE guests SET promoted_user_id=?, name=? WHERE guest_id=?",
@@ -647,8 +684,6 @@ class Gallery:
                 conn.commit()
             finally:
                 conn.close()
-        # Seed the member's face profile from the cluster centroid + carry its face image.
-        self.enroll(user_id, name, json.loads(row[0]), thumb=row[1] if carry_thumb else None)
         return True
 
     def member_clusters(self, user_id: str) -> List[dict]:
@@ -694,13 +729,11 @@ class Gallery:
         return json.loads(row[0]) if row else None
 
     def detach_cluster(self, guest_id: str) -> Optional[str]:
-        """"This one wasn't me." Reverse an auto-heal/promote of a HOUSEHOLD member:
-          * best-effort un-merge the cluster's contribution from the member centroid
-            (weight 1 — the inverse of how promote_guest folded it in via enroll's
-            running-mean; a single cluster among many barely moves a seasoned centroid,
-            which is intended: one bad fold shouldn't wreck an identity),
-          * clear the promotion + name so the cluster re-enters the review queue,
-          * record the member in the cluster's rejected set so it never auto-heals back.
+        """"This one wasn't me." Reverse a promote/auto-heal of a HOUSEHOLD member:
+        clear the promotion + name so the cluster re-enters the review queue, and
+        record the member in the cluster's rejected set so it never auto-heals back.
+        Nothing to un-merge anymore: promotions stopped folding into the member
+        centroid (see promote_guest) — the member profile was never touched.
         Returns the member id it was detached from, or None if the cluster isn't a
         member promotion (missing, or merged into a NAMED guest — handled elsewhere)."""
         with _lock:
@@ -712,19 +745,8 @@ class Gallery:
                 if not row or not row[1]:
                     return None
                 member = row[1]
-                face = conn.execute(
-                    "SELECT embedding, samples FROM faces WHERE user_id=?", (member,)).fetchone()
-                if not face:
-                    return None  # promoted into a named guest, not a member — not our case
-                c_emb = json.loads(row[0])
-                m_emb, m_n = json.loads(face[0]), int(face[1])
-                if m_n > 1:
-                    # inverse running-mean: recover the centroid before this weight-1 fold.
-                    unmerged = _normalise([(m_emb[i] * m_n - c_emb[i]) / (m_n - 1)
-                                           for i in range(len(m_emb))])
-                    conn.execute(
-                        "UPDATE faces SET embedding=?, samples=?, updated_at=datetime('now') WHERE user_id=?",
-                        (json.dumps(unmerged), m_n - 1, member))
+                if member.startswith("guest:"):
+                    return None  # merged into a NAMED guest, not a member — not our case
                 rejected = self._parse_rejected(row[2])
                 rejected.add(member)
                 conn.execute(

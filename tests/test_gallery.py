@@ -56,8 +56,10 @@ def test_promote_guest_seeds_household_gallery():
 def test_promoted_cluster_match_answers_as_household_member():
     """The david-as-guest bug: a live embedding that FAILS the strict household gate
     (far/angled camera) but still matches a PROMOTED cluster must answer as the member
-    (cls household, their id), not as a guest — and reinforce the member's gallery so
-    the household centroid converges on what that camera actually sees."""
+    (cls household, their id), not as a guest. The member's face PROFILE stays
+    untouched — promotion is routing, never a fold (the 2026-07-07 pollution lesson:
+    folding cluster centroids into members at enroll weight is how two members'
+    centroids converged and swapped)."""
     cfg.face_match_threshold = 0.99   # household gate the drifted vector can't clear
     cfg.guest_cluster_threshold = 0.9
     cfg.face_reinforce = True
@@ -68,12 +70,11 @@ def test_promoted_cluster_match_answers_as_household_member():
     assert g.promote_guest("guest:1", "u9", "Sam")
     drifted = _vec(3.0)
     drifted[4] = 0.33  # cosine ~0.95 to v: fails 0.99 household gate, clears 0.9 cluster
-    before = g._best_household(drifted)[2]
     ident = g.resolve(drifted)
     assert ident.cls == "household" and ident.id == "u9" and ident.name == "Sam"
     assert ident.confidence >= 0.6  # passes the agent's naming gate
-    # the member's gallery centroid moved toward the drifted look (reinforcement)
-    assert g._best_household(drifted)[2] > before
+    # promotion created NO face profile — the member is recognized via the cluster only
+    assert g._best_household(drifted)[0] is None
 
 
 def test_forget_removes_profile():
@@ -115,7 +116,14 @@ def test_promoted_guest_drops_from_people_and_carries_face():
     g.promote_guest("guest:1", "u9", "Sam")
     ids = {p["id"] for p in g.people()}
     assert "guest:1" not in ids and "u9" in ids       # promoted guest no longer a guest row
-    assert g.get_thumb("u9") == b"GUESTFACE"           # face carried into the member profile
+    u9 = next(p for p in g.people() if p["id"] == "u9")
+    assert u9["class"] == "household" and u9["samples"] == 0   # roster entry, not enrolled
+    assert g.get_thumb("u9") == b"GUESTFACE"           # cluster's face LENT at read time
+    conn = g._db()
+    try:  # promotion never writes the faces table (the fold was the pollution engine)
+        assert conn.execute("SELECT COUNT(*) FROM faces WHERE user_id='u9'").fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 def test_online_reinforcement_strengthens_household_on_confident_match():

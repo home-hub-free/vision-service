@@ -140,12 +140,43 @@ class Config:
     # the detail that lets it find a DISTANT face; 1024–1280 recovers range at the cost of
     # more CPU per detected NEW track (SCRFD only runs on new/unmatched tracks at
     # detect_fps, so it's affordable). `det_thresh` is SCRFD's own confidence bar (its
-    # default is 0.5) — lower it to keep weak far-face detections. `face_min_px` is an
-    # optional post-detect gate: skip embedding a face whose bbox longest side is under
-    # this many pixels, so tiny low-detail faces don't seed noisy guest clusters. 0 = off.
+    # default is 0.5) — lower it to keep weak far-face detections. `face_min_px` is the
+    # identity size floor: a face whose bbox longest side is under this many pixels never
+    # produces an IDENTITY embedding (0 = off). It is applied by the camera worker AFTER
+    # the high-res upgrade pass — a small substream face still triggers the main-stream
+    # re-embed (which usually lifts it past the floor); only what is STILL small after
+    # that abstains. ArcFace works at 112×112: below ~70 source pixels the embedding is
+    # measurably noise (2026-07-07: noise embeddings averaged into member centroids made
+    # two members read cos 0.702 apart and swap names).
     face_det_size: int = field(default_factory=lambda: _i("VISION_FACE_DET_SIZE", 1024))
     face_det_thresh: float = field(default_factory=lambda: _f("VISION_FACE_DET_THRESH", 0.4))
-    face_min_px: int = field(default_factory=lambda: _i("VISION_FACE_MIN_PX", 0))
+    face_min_px: int = field(default_factory=lambda: _i("VISION_FACE_MIN_PX", 72))
+
+    # ── identity-grade quality gate (the 2026-07-07 pollution lesson) ─────────
+    # Embeddings of blurry / turned-away / low-confidence faces are noise: measured on
+    # the live capture ledger, one person's own enroll burst agreed with itself at only
+    # cos ~0.2, and averaging hundreds of such vectors converged two members' centroids
+    # onto the shared "average junk" direction (david-vs-ana 0.702) — the swap engine.
+    # A face below ANY of these bars still counts for occupancy ("someone is here") but
+    # ABSTAINS from identity: no member match, no guest cluster, no fold, no enroll.
+    # Gates are enforced inside the face engine (det/pose/sharpness are intrinsic to
+    # the face) except size, which the camera owns (see face_min_px above).
+    face_min_det_score: float = field(default_factory=lambda: _f("VISION_FACE_MIN_DET_SCORE", 0.55))
+    face_max_yaw: float = field(default_factory=lambda: _f("VISION_FACE_MAX_YAW", 45.0))
+    face_max_pitch: float = field(default_factory=lambda: _f("VISION_FACE_MAX_PITCH", 35.0))
+    # Sharpness = Laplacian variance of the gray face crop (downscale-only to ≤112px so
+    # the number is comparable across sizes). Well-lit sharp faces read hundreds; motion
+    # blur / defocus reads single digits to ~25.
+    face_min_sharpness: float = field(default_factory=lambda: _f("VISION_FACE_MIN_SHARPNESS", 30.0))
+    # Enrollment samples are ground truth (the anchor set every identity decision leans
+    # on), so the enroll gate is STRICTER than the live gate — and it must reject with
+    # an actionable reason so the guided flow can coach instead of silently accepting a
+    # profile-view 87px face as "who david is" (that literally happened).
+    enroll_min_px: int = field(default_factory=lambda: _i("VISION_ENROLL_MIN_PX", 110))
+    enroll_min_det_score: float = field(default_factory=lambda: _f("VISION_ENROLL_MIN_DET_SCORE", 0.65))
+    enroll_max_yaw: float = field(default_factory=lambda: _f("VISION_ENROLL_MAX_YAW", 30.0))
+    enroll_max_pitch: float = field(default_factory=lambda: _f("VISION_ENROLL_MAX_PITCH", 25.0))
+    enroll_min_sharpness: float = field(default_factory=lambda: _f("VISION_ENROLL_MIN_SHARPNESS", 60.0))
 
     # Online reinforcement (§4.3): on a confident, UNAMBIGUOUS household match, fold the
     # live embedding into that member's centroid so passive recognition self-improves

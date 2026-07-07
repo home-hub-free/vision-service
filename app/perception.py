@@ -378,6 +378,57 @@ def make_pose_engine():
     return NullPoseEngine()
 
 
+# ── identity-grade quality gate (config.py "quality gate" block) ─────────────
+def face_sharpness(frame, bbox: BBox) -> Optional[float]:
+    """Laplacian variance of the gray face crop — the blur gauge. Downscale-only to
+    ≤112px longest side so the number is comparable across face sizes (upscaling a
+    small crop would smooth it into an automatic fail, double-counting size, which
+    the size floor already owns). None = can't judge (no cv2 / empty crop)."""
+    cv2 = _cv2()
+    if cv2 is None or frame is None:
+        return None
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = (int(v) for v in bbox)
+    x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return 0.0
+    crop = _resize_max(frame[y1:y2, x1:x2], 112)
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def face_quality_reason(face, frame, *, enroll: bool = False) -> Optional[str]:
+    """Why this detected face must ABSTAIN from identity decisions (None = fit).
+    ArcFace embeddings of low-confidence / turned-away / blurry faces are noise —
+    measured live 2026-07-07: a member's own enroll burst self-agreed at cos ~0.2,
+    and noise-mean centroids made two members swap names. Size is deliberately NOT
+    checked here for the live path (the camera applies `face_min_px` after its
+    high-res rescue); the enroll path checks size in `assess_enroll` (no rescue).
+    `face` is an insightface Face (det_score / pose / bbox); pose is skipped
+    gracefully when the landmark model didn't supply it."""
+    if enroll:
+        min_det, max_yaw, max_pitch, min_sharp = (
+            cfg.enroll_min_det_score, cfg.enroll_max_yaw,
+            cfg.enroll_max_pitch, cfg.enroll_min_sharpness)
+    else:
+        min_det, max_yaw, max_pitch, min_sharp = (
+            cfg.face_min_det_score, cfg.face_max_yaw,
+            cfg.face_max_pitch, cfg.face_min_sharpness)
+    det = getattr(face, "det_score", None)
+    if det is not None and float(det) < min_det:
+        return "low_confidence"
+    pose = getattr(face, "pose", None)  # (pitch, yaw, roll) degrees, landmark_3d_68
+    if pose is not None and len(pose) >= 2:
+        pitch, yaw = float(pose[0]), float(pose[1])
+        if abs(yaw) > max_yaw or abs(pitch) > max_pitch:
+            return "off_angle"
+    if min_sharp > 0:
+        sharp = face_sharpness(frame, face.bbox)
+        if sharp is not None and sharp < min_sharp:
+            return "blurry"
+    return None
+
+
 # ── face engines ─────────────────────────────────────────────────────────────
 class NullFaceEngine:
     backend = "null"
@@ -403,20 +454,17 @@ class _InsightFaceEngine:
         providers = os.getenv("VISION_ORT_PROVIDERS", "CPUExecutionProvider").split(",")
         self._app = FaceAnalysis(name=os.getenv("VISION_FACE_MODEL", "buffalo_l"), providers=providers)
         # det_size / det_thresh are the far-face levers (see config.py): a larger square
-        # finds smaller/more-distant faces, a lower threshold keeps weak ones. min_px gates
-        # out faces too small to embed cleanly (0 = keep everything).
+        # finds smaller/more-distant faces, a lower threshold keeps weak ones. Size is
+        # NOT gated here — the camera owns `face_min_px` (applied after its high-res
+        # rescue, so a small substream face can still be saved by the main stream);
+        # this engine gates the intrinsic quality bars (det/pose/sharpness) instead.
         det = max(160, cfg.face_det_size)
-        self._min_px = max(0, cfg.face_min_px)
         self._app.prepare(ctx_id=0 if "CPU" not in providers[0] else -1,
                           det_size=(det, det), det_thresh=cfg.face_det_thresh)
         print(f"[vision] insightface buffalo_l providers={providers} "
-              f"det_size={det} det_thresh={cfg.face_det_thresh} min_px={self._min_px}", flush=True)
-
-    def _too_small(self, box) -> bool:
-        """True when a detected face bbox is smaller than the min_px gate (longest side)."""
-        if self._min_px <= 0:
-            return False
-        return max(box[2] - box[0], box[3] - box[1]) < self._min_px
+              f"det_size={det} det_thresh={cfg.face_det_thresh} "
+              f"quality(det≥{cfg.face_min_det_score} yaw≤{cfg.face_max_yaw} "
+              f"pitch≤{cfg.face_max_pitch} sharp≥{cfg.face_min_sharpness})", flush=True)
 
     def embed(self, frame, bbox: BBox) -> Optional[List[float]]:
         hit = self.embed_face(frame, bbox)
@@ -424,7 +472,9 @@ class _InsightFaceEngine:
 
     def embed_face(self, frame, bbox: BBox) -> Optional[Tuple[List[float], BBox]]:
         """(embedding, face bbox in FRAME coords) for the largest face inside the
-        track box — the face bbox is what the review-card crop centers on."""
+        track box — the face bbox is what the review-card crop centers on. A face
+        failing the identity-quality gate answers None (identity abstains — the
+        person still counts for occupancy via their YOLO track)."""
         x1, y1, x2, y2 = bbox
         ox, oy = max(0, x1), max(0, y1)
         crop = frame[oy:y2, ox:x2]
@@ -435,24 +485,52 @@ class _InsightFaceEngine:
             return None
         face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
         emb = getattr(face, "normed_embedding", None)
-        if emb is None or self._too_small(face.bbox):
-            return None  # no face, or too small/low-detail to embed cleanly
+        if emb is None or face_quality_reason(face, crop) is not None:
+            return None  # no face, or not identity-grade (blur/angle/confidence)
         fx1, fy1, fx2, fy2 = (int(v) for v in face.bbox)
         return emb.tolist(), (ox + fx1, oy + fy1, ox + fx2, oy + fy2)
 
     def faces(self, frame) -> List[Tuple[List[float], BBox]]:
-        """EVERY face in the frame with its embedding — used to re-locate the right
-        face inside a stored (legacy full-person) thumbnail."""
+        """EVERY identity-grade face in the frame with its embedding — the multi-person
+        frame-level pass (exclusive assignment) and thumb re-location both use it.
+        Quality-gated like embed_face: a blurry/turned face is skipped, so it can
+        neither claim a member nor seed a junk cluster."""
         if frame is None or getattr(frame, "size", 0) == 0:
             return []
         out: List[Tuple[List[float], BBox]] = []
         for face in self._app.get(frame):
             emb = getattr(face, "normed_embedding", None)
-            if emb is None:
+            if emb is None or face_quality_reason(face, frame) is not None:
                 continue
             x1, y1, x2, y2 = (int(v) for v in face.bbox)
             out.append((emb.tolist(), (x1, y1, x2, y2)))
         return out
+
+    def assess_enroll(self, frame) -> Tuple[Optional[List[float]], Optional[str]]:
+        """(embedding, None) for an enrollment-grade photo, else (None, reason).
+        Enrollment is ground truth so the STRICT gate applies, and the reason is
+        actionable (the guided flow shows it verbatim): exactly one face of real
+        size — a second comparable face means we can't know whose profile this
+        feeds (the 2026-07-06 ledger shows three people's enrolls interleaving
+        within the same minute); then size / confidence / pose / sharpness."""
+        faces = self._app.get(frame)
+        if not faces:
+            return None, "no_face"
+        px = lambda f: max(f.bbox[2] - f.bbox[0], f.bbox[3] - f.bbox[1])  # noqa: E731
+        faces.sort(key=px, reverse=True)
+        main = faces[0]
+        main_px = px(main)
+        if any(px(f) >= max(40.0, main_px * 0.5) for f in faces[1:]):
+            return None, "multiple_faces"
+        if main_px < cfg.enroll_min_px:
+            return None, "too_small"
+        reason = face_quality_reason(main, frame, enroll=True)
+        if reason is not None:
+            return None, reason
+        emb = getattr(main, "normed_embedding", None)
+        if emb is None:
+            return None, "no_face"
+        return emb.tolist(), None
 
 
 # ── factories (graceful fallback to null) ─────────────────────────────────────
@@ -529,17 +607,17 @@ def annotate_face_in_thumb(jpeg: bytes, centroid: List[float]) -> Optional[List[
             round((x2 - x1) / w, 4), round((y2 - y1) / h, 4)]
 
 
-def enroll_embedding(jpeg: bytes) -> Optional[List[float]]:
-    """Image bytes → a face embedding to store in the gallery. Uses the real face
-    engine (largest face in the frame) when one is installed; otherwise the
-    deterministic stub so the plumbing works in the null build."""
+def enroll_embedding(jpeg: bytes) -> Tuple[Optional[List[float]], Optional[str]]:
+    """Image bytes → (embedding, None) when the photo is enrollment-grade, else
+    (None, reason). Enrollment samples are the anchors every identity decision
+    leans on, so the strict gate runs here (exactly one face, size, confidence,
+    pose, sharpness — see `assess_enroll`); the route maps `reason` to an
+    actionable 422 the guided flow shows the user. The null build keeps the
+    deterministic stub (plumbing tests, no face model installed)."""
     eng = _get_shared_face_engine()
     if getattr(eng, "backend", "null") != "null":
         frame = decode_jpeg(jpeg)
-        if frame is not None:
-            h, w = frame.shape[:2]
-            emb = eng.embed(frame, (0, 0, w, h))
-            if emb is not None:
-                return emb
-        return None  # real engine found no face — let the caller report "no face"
-    return _stub_embedding(jpeg)
+        if frame is None:
+            return None, "no_face"
+        return eng.assess_enroll(frame)
+    return _stub_embedding(jpeg), None

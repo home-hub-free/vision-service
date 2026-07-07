@@ -104,9 +104,11 @@ def cmd_rebuild(g: Gallery, user_id: str, from_dir: str, name: str | None,
             if getattr(engine, "backend", "null") != "null":
                 from app.perception import enroll_embedding
                 with open(os.path.join(from_dir, fname), "rb") as fh:
-                    emb = enroll_embedding(fh.read())
+                    emb, reason = enroll_embedding(fh.read())
                 if emb is not None:
                     reembedded += 1
+                elif reason:
+                    print(f"  {fname}: not enrollment-grade ({reason}) — skipped")
         if emb is None:
             skipped.append(fname)
             continue

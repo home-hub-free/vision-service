@@ -70,6 +70,7 @@ def _worker():
 
 
 def test_embed_tracks_multi_person_uses_one_frame_detection_exclusively():
+    cfg.face_min_px = 0  # exclusivity mechanics under test, not the size floor
     w = _worker()
     tracks = [_track("d", (0, 0, 400, 600)), _track("a", (150, 100, 350, 500))]
     w.face = _FakeFaceEngine([([0.1] * 4, (220, 140, 300, 220)),

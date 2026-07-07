@@ -419,29 +419,36 @@ class CameraWorker(threading.Thread):
         degraded sampler passes substream embeddings through unchanged."""
         out = self._embed_pass(frame, tracks, wanted)
         min_px = cfg.highres_min_face_px
-        if self.highres is None or min_px <= 0:
-            return {tid: v[:3] for tid, v in out.items()}
-        small = [tid for tid, (emb, _t, _tb, px) in out.items()
-                 if emb is not None and 0 < px < min_px]
-        if small:
-            hi = self.highres.get_frame()
-            if hi is not None:
-                sx = hi.shape[1] / frame.shape[1]
-                sy = hi.shape[0] / frame.shape[0]
-                hi_tracks = [DetectedTrack(track_id=t.track_id,
-                                           bbox=(int(t.bbox[0] * sx), int(t.bbox[1] * sy),
-                                                 int(t.bbox[2] * sx), int(t.bbox[3] * sy)))
-                             for t in tracks]
-                hi_out = self._embed_pass(hi, hi_tracks, {tid: wanted[tid] for tid in small})
-                for tid in small:
-                    emb, thumb, thumb_box, px = hi_out.get(tid, (None, None, None, 0))
-                    if emb is not None:  # no face on the hi frame → keep the lo result
-                        out[tid] = (emb, thumb, thumb_box, px)
-            elif not self.highres.degraded:
-                for tid in small:
-                    if wanted.get(tid) == "resolve":
-                        out[tid] = (None, None, None, 0)
-        return {tid: v[:3] for tid, v in out.items()}
+        if self.highres is not None and min_px > 0:
+            small = [tid for tid, (emb, _t, _tb, px) in out.items()
+                     if emb is not None and 0 < px < min_px]
+            if small:
+                hi = self.highres.get_frame()
+                if hi is not None:
+                    sx = hi.shape[1] / frame.shape[1]
+                    sy = hi.shape[0] / frame.shape[0]
+                    hi_tracks = [DetectedTrack(track_id=t.track_id,
+                                               bbox=(int(t.bbox[0] * sx), int(t.bbox[1] * sy),
+                                                     int(t.bbox[2] * sx), int(t.bbox[3] * sy)))
+                                 for t in tracks]
+                    hi_out = self._embed_pass(hi, hi_tracks, {tid: wanted[tid] for tid in small})
+                    for tid in small:
+                        emb, thumb, thumb_box, px = hi_out.get(tid, (None, None, None, 0))
+                        if emb is not None:  # no face on the hi frame → keep the lo result
+                            out[tid] = (emb, thumb, thumb_box, px)
+                elif not self.highres.degraded:
+                    for tid in small:
+                        if wanted.get(tid) == "resolve":
+                            out[tid] = (None, None, None, 0)
+        # Identity size floor, applied AFTER the high-res rescue had its shot: a face
+        # still under face_min_px is below what ArcFace can embed meaningfully (the
+        # noise that smeared member centroids together) — the track keeps counting for
+        # occupancy, but identity abstains rather than guessing.
+        floor = max(0, cfg.face_min_px)
+        return {tid: ((None, None, None)
+                      if (v[0] is not None and floor and 0 < v[3] < floor)
+                      else v[:3])
+                for tid, v in out.items()}
 
     def _embed_pass(self, frame, tracks, wanted) -> Dict[str, tuple]:
         """(emb, thumb, thumb_box, face_px) per wanted track id, on ONE frame. With one
@@ -455,9 +462,11 @@ class CameraWorker(threading.Thread):
         if not wanted:
             return out
         if len(tracks) > 1 and hasattr(self.face, "faces"):
-            min_px = max(0, cfg.face_min_px)
-            faces = [(emb, box) for emb, box in self.face.faces(frame)
-                     if not min_px or max(box[2] - box[0], box[3] - box[1]) >= min_px]
+            # No size filter here: small faces must flow through so the high-res
+            # upgrade in _embed_tracks can rescue them — the face_min_px floor is
+            # applied there, after the rescue. Intrinsic quality (blur/pose/conf)
+            # is already gated inside the engine.
+            faces = self.face.faces(frame)
             assigned = assign_faces_to_tracks(faces, tracks)
             for tid in wanted:
                 hit = assigned.get(tid)
