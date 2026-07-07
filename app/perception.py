@@ -470,11 +470,14 @@ class _InsightFaceEngine:
         hit = self.embed_face(frame, bbox)
         return hit[0] if hit else None
 
-    def embed_face(self, frame, bbox: BBox) -> Optional[Tuple[List[float], BBox]]:
+    def embed_face(self, frame, bbox: BBox) -> Optional[Tuple[Optional[List[float]], BBox]]:
         """(embedding, face bbox in FRAME coords) for the largest face inside the
         track box — the face bbox is what the review-card crop centers on. A face
-        failing the identity-quality gate answers None (identity abstains — the
-        person still counts for occupancy via their YOLO track)."""
+        failing the identity-quality gate answers (None, bbox): FOUND but abstaining
+        (no embedding leaves the engine), so the caller can still trigger the
+        high-res rescue — det/sharpness genuinely improve on the main-stream frame
+        (measured live: det 0.49 sub → 0.77 main on the same face). None means no
+        face at all."""
         x1, y1, x2, y2 = bbox
         ox, oy = max(0, x1), max(0, y1)
         crop = frame[oy:y2, ox:x2]
@@ -485,25 +488,31 @@ class _InsightFaceEngine:
             return None
         face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
         emb = getattr(face, "normed_embedding", None)
-        if emb is None or face_quality_reason(face, crop) is not None:
-            return None  # no face, or not identity-grade (blur/angle/confidence)
+        if emb is None:
+            return None
         fx1, fy1, fx2, fy2 = (int(v) for v in face.bbox)
-        return emb.tolist(), (ox + fx1, oy + fy1, ox + fx2, oy + fy2)
+        fbox = (ox + fx1, oy + fy1, ox + fx2, oy + fy2)
+        if face_quality_reason(face, crop) is not None:
+            return None, fbox  # found-but-abstained (blur/angle/confidence)
+        return emb.tolist(), fbox
 
-    def faces(self, frame) -> List[Tuple[List[float], BBox]]:
-        """EVERY identity-grade face in the frame with its embedding — the multi-person
-        frame-level pass (exclusive assignment) and thumb re-location both use it.
-        Quality-gated like embed_face: a blurry/turned face is skipped, so it can
-        neither claim a member nor seed a junk cluster."""
+    def faces(self, frame) -> List[Tuple[Optional[List[float]], BBox]]:
+        """EVERY face in the frame — identity-grade ones with their embedding,
+        quality-abstained ones as (None, bbox) so the multi-person pass can still
+        assign them to tracks and trigger the high-res rescue. An abstained face
+        can neither claim a member nor seed a cluster (no embedding exists)."""
         if frame is None or getattr(frame, "size", 0) == 0:
             return []
-        out: List[Tuple[List[float], BBox]] = []
+        out: List[Tuple[Optional[List[float]], BBox]] = []
         for face in self._app.get(frame):
             emb = getattr(face, "normed_embedding", None)
-            if emb is None or face_quality_reason(face, frame) is not None:
+            if emb is None:
                 continue
             x1, y1, x2, y2 = (int(v) for v in face.bbox)
-            out.append((emb.tolist(), (x1, y1, x2, y2)))
+            if face_quality_reason(face, frame) is not None:
+                out.append((None, (x1, y1, x2, y2)))
+            else:
+                out.append((emb.tolist(), (x1, y1, x2, y2)))
         return out
 
     def assess_enroll(self, frame) -> Tuple[Optional[List[float]], Optional[str]]:
@@ -597,7 +606,7 @@ def annotate_face_in_thumb(jpeg: bytes, centroid: List[float]) -> Optional[List[
     frame = decode_jpeg(jpeg)
     if frame is None:
         return None
-    hits = eng.faces(frame)
+    hits = [h for h in eng.faces(frame) if h[0] is not None]  # need embeddings to pick WHOSE face
     if not hits:
         return []
     h, w = frame.shape[:2]

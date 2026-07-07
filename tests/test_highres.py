@@ -117,6 +117,45 @@ def test_degraded_sampler_passes_substream_through():
     assert out["a"][0] == [0.1] * 4
 
 
+class _AbstainOnLoFace:
+    """Fake engine for the rescue-on-abstain path: the LO frame finds a face but
+    abstains (quality gate — returns (None, box)); the HI frame reads it cleanly."""
+
+    backend = "fake"
+
+    def embed_face(self, frame, bbox):
+        if frame.shape[1] == LO.shape[1]:
+            return None, (bbox[0] + 10, bbox[1] + 10, bbox[0] + 50, bbox[1] + 50)
+        return [0.9] * 4, (bbox[0] + 40, bbox[1] + 40, bbox[0] + 200, bbox[1] + 200)
+
+    def faces(self, frame):
+        return []
+
+
+def test_quality_abstained_face_still_triggers_rescue():
+    """A face the engine FOUND but abstained on (blur/angle/confidence at substream
+    quality) is exactly the face that needs the main-stream pixels — measured live:
+    det 0.49 on the sub frame vs 0.77 on the main frame for the same face. The
+    rescue must fire for it, and the clean hi-frame embedding wins."""
+    cfg.highres_min_face_px = 90
+    cfg.face_min_px = 72
+    w = _worker()
+    w.face = _AbstainOnLoFace()
+    w.highres = _FakeSampler(frame=HI)
+    out = w._embed_tracks(LO, [DetectedTrack(track_id="a", bbox=(0, 0, 100, 200))],
+                          {"a": "resolve"})
+    assert out["a"][0] == [0.9] * 4
+    assert w.highres.calls == 1
+    # rescue unavailable → the abstained face stays abstained (never a junk embed)
+    w = _worker()
+    w.face = _AbstainOnLoFace()
+    w.highres = _FakeSampler(frame=None, degraded=True)
+    out = w._embed_tracks(LO, [DetectedTrack(track_id="a", bbox=(0, 0, 100, 200))],
+                          {"a": "resolve"})
+    assert out["a"] == (None, None, None)
+    cfg.face_min_px = 0
+
+
 def test_identity_floor_applies_after_rescue():
     """face_min_px is enforced AFTER the high-res rescue had its shot: a face the
     rescue could not lift past the floor abstains from identity entirely (no noise

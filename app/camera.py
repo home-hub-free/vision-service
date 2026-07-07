@@ -420,8 +420,13 @@ class CameraWorker(threading.Thread):
         out = self._embed_pass(frame, tracks, wanted)
         min_px = cfg.highres_min_face_px
         if self.highres is not None and min_px > 0:
+            # Upgrade candidates: a face that embedded but SMALL, and equally a face
+            # the engine FOUND but abstained on (emb None, px known) — det/sharpness
+            # improve on the main-stream frame just like size does (measured live:
+            # det 0.49 sub → 0.77 main). The faces most in need of rescue are
+            # exactly the ones the quality gate held back.
             small = [tid for tid, (emb, _t, _tb, px) in out.items()
-                     if emb is not None and 0 < px < min_px]
+                     if 0 < px < min_px or (emb is None and px > 0)]
             if small:
                 hi = self.highres.get_frame()
                 if hi is not None:
@@ -443,10 +448,11 @@ class CameraWorker(threading.Thread):
         # Identity size floor, applied AFTER the high-res rescue had its shot: a face
         # still under face_min_px is below what ArcFace can embed meaningfully (the
         # noise that smeared member centroids together) — the track keeps counting for
-        # occupancy, but identity abstains rather than guessing.
+        # occupancy, but identity abstains rather than guessing. Entries that stayed
+        # abstained (emb None) collapse to the plain "no face" shape.
         floor = max(0, cfg.face_min_px)
         return {tid: ((None, None, None)
-                      if (v[0] is not None and floor and 0 < v[3] < floor)
+                      if (v[0] is None or (floor and 0 < v[3] < floor))
                       else v[:3])
                 for tid, v in out.items()}
 
