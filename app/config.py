@@ -333,6 +333,18 @@ class Config:
     face_autoheal_threshold: float = field(default_factory=lambda: _f("VISION_FACE_AUTOHEAL_THRESHOLD", 0.5))
     face_autoheal_margin: float = field(default_factory=lambda: _f("VISION_FACE_AUTOHEAL_MARGIN", 0.08))
     face_suggest_threshold: float = field(default_factory=lambda: _f("VISION_FACE_SUGGEST_THRESHOLD", 0.2))
+    # Autoheal MATURITY: a cluster must earn the right to be silently folded into an
+    # identity — never promote a single frame (2026-07-07: ~110 mostly single-sighting
+    # clusters auto-promoted in 24h, each a junk embedding wearing a member's name).
+    # A cluster is eligible only when it has enough sightings, spread over enough
+    # wall-clock time (a 20-frame burst of one bad angle is still one look), and its
+    # recorded captures agree with its own centroid (internal coherence — a cluster
+    # that is a grab-bag of different faces must go to the human review queue, not
+    # silently become somebody). The human "Is this you?" flow is NOT gated: a
+    # deliberate answer beats maturity.
+    face_autoheal_min_sightings: int = field(default_factory=lambda: _i("VISION_FACE_AUTOHEAL_MIN_SIGHTINGS", 5))
+    face_autoheal_min_span_s: float = field(default_factory=lambda: _f("VISION_FACE_AUTOHEAL_MIN_SPAN_S", 600.0))
+    face_autoheal_min_coherence: float = field(default_factory=lambda: _f("VISION_FACE_AUTOHEAL_MIN_COHERENCE", 0.45))
 
     def __post_init__(self) -> None:
         for d in (DATA, self.rec_dir, self.hls_dir):

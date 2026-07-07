@@ -36,6 +36,10 @@ def gallery(monkeypatch):
     cfg.face_autoheal_threshold = 0.9
     cfg.face_autoheal_margin = 0.05
     cfg.face_suggest_threshold = 0.4
+    # Route tests exercise the tier plumbing; autoheal maturity has its own tests.
+    cfg.face_autoheal_min_sightings = 1
+    cfg.face_autoheal_min_span_s = 0.0
+    cfg.face_autoheal_min_coherence = 0.0
     g = Gallery(os.path.join(tempfile.mkdtemp(), "gallery.db"))
     monkeypatch.setattr(guests_routes, "gallery", g)
     monkeypatch.setattr(guests_routes, "require_user",

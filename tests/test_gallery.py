@@ -198,6 +198,10 @@ def _set_tiers(match=0.99, cluster=0.999999, heal=0.9, margin=0.05, suggest=0.4)
     cfg.face_autoheal_threshold = heal
     cfg.face_autoheal_margin = margin
     cfg.face_suggest_threshold = suggest
+    # These tests exercise the TIER ladder; autoheal maturity has its own tests.
+    cfg.face_autoheal_min_sightings = 1
+    cfg.face_autoheal_min_span_s = 0.0
+    cfg.face_autoheal_min_coherence = 0.0
 
 
 def test_review_queue_buckets_by_confidence_tier():

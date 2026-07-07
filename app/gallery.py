@@ -907,14 +907,53 @@ class Gallery:
             finally:
                 conn.close()
 
+    def _heal_eligible(self, guest_id: str) -> bool:
+        """Maturity gate for SILENT auto-folds (the human review flow is never gated —
+        a deliberate answer beats maturity): enough sightings, spread over enough
+        wall-clock time, and internally coherent. Never promote a single frame —
+        2026-07-07: ~110 mostly single-sighting clusters were auto-promoted in 24h,
+        each one junk embedding wearing a member's name from then on."""
+        conn = self._db()
+        try:
+            row = conn.execute(
+                """SELECT sightings,
+                          (julianday(last_seen) - julianday(first_seen)) * 86400.0,
+                          embedding
+                   FROM guests WHERE guest_id=?""", (guest_id,)).fetchone()
+            if not row:
+                return False
+            sightings, span_s = int(row[0]), float(row[1] or 0.0)
+            if sightings < max(1, cfg.face_autoheal_min_sightings):
+                return False
+            if span_s < cfg.face_autoheal_min_span_s:
+                return False
+            # Internal coherence: the cluster's recorded captures must agree with its
+            # own centroid — a grab-bag of different faces (means of noise can drift
+            # anywhere) goes to the human queue instead of silently becoming somebody.
+            # Fewer than 3 recorded captures = nothing to judge → don't block (the
+            # sightings/span bars above still hold; captures may be disabled).
+            if cfg.face_autoheal_min_coherence > 0:
+                embs = [json.loads(r[0]) for r in conn.execute(
+                    """SELECT embedding FROM captures WHERE cluster_id=?
+                       ORDER BY id DESC LIMIT 20""", (guest_id,))]
+                if len(embs) >= 3:
+                    centroid = json.loads(row[2])
+                    coh = sum(_cosine(e, centroid) for e in embs) / len(embs)
+                    if coh < cfg.face_autoheal_min_coherence:
+                        return False
+            return True
+        finally:
+            conn.close()
+
     def _maybe_autoheal(self, guest_id: str
                         ) -> Optional[Tuple[str, str, Optional[str], float]]:
-        """Top tier of the self-healing ladder: if an UNNAMED, unpromoted cluster's
-        centroid now matches a known identity decisively (≥ autoheal threshold AND
-        unambiguous margin — same strictness posture as reinforce), fold it in
-        silently: household member → promote, named guest → merge. Reports
-        (kind, id, name, score). Named clusters are deliberate labels and are never
-        auto-merged AWAY; rejected identities are never healed into."""
+        """Top tier of the self-healing ladder: if a MATURE (see _heal_eligible),
+        unnamed, unpromoted cluster's centroid now matches a known identity
+        decisively (≥ autoheal threshold AND unambiguous margin — same strictness
+        posture as reinforce), fold it in silently: household member → promote,
+        named guest → merge. Reports (kind, id, name, score). Named clusters are
+        deliberate labels and are never auto-merged AWAY; rejected identities are
+        never healed into."""
         conn = self._db()
         try:
             row = conn.execute(
@@ -923,6 +962,8 @@ class Gallery:
         finally:
             conn.close()
         if not row or row[2] is not None:
+            return None
+        if not self._heal_eligible(guest_id):
             return None
         kind, tid, tname, score, margin = self._best_identity(
             json.loads(row[0]), exclude=self._parse_rejected(row[1]),
@@ -961,7 +1002,8 @@ class Gallery:
             kind, tid, tname, score, margin = self._best_identity(
                 emb, exclude=rejected, exclude_guest=gid)
             if (tid is not None and score >= self._thr("face_autoheal_threshold")
-                    and margin >= self._thr("face_autoheal_margin")):
+                    and margin >= self._thr("face_autoheal_margin")
+                    and self._heal_eligible(gid)):
                 if kind == "member":
                     self.promote_guest(gid, tid, tname, carry_thumb=False)
                 else:
