@@ -604,7 +604,10 @@ class Gallery:
         with an anchor set never reinforces — anchors are immutable ground truth, and
         every runtime fold into a shared mean was a measured pollution channel (the
         2026-07-07 lesson); their centroid row is a derived cache the next enroll
-        recomputes, so drifting it would be both risky and pointless."""
+        recomputes, so drifting it would be both risky and pointless. The smear
+        freeze covers this fold too — "every silent fold" means every one."""
+        if self.folds_frozen:
+            return
         emb = _normalise(emb)
         cap = max(1, cfg.face_reinforce_cap)
         with _lock:

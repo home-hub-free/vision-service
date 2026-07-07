@@ -63,6 +63,22 @@ def test_smear_alarm_freezes_folds_and_self_clears():
     probe = _mix(1.0, 3.0, 0.95)
     assert g.resolve(probe).cls == "guest"
     assert g.review_queue()["healed"] == []
+    # ... and legacy (anchor-less) reinforcement is frozen too — every silent fold.
+    import json as _json
+    conn = g._db()
+    try:
+        conn.execute("INSERT INTO faces (user_id, name, embedding, samples) VALUES (?,?,?,1)",
+                     ("legacy", "Old", _json.dumps(_vec(9.0))))
+        conn.commit()
+    finally:
+        conn.close()
+    cfg.face_reinforce = True
+    cfg.face_reinforce_threshold = 0.5
+    cfg.face_reinforce_margin = 0.05
+    cfg.face_match_threshold = 0.5
+    g.resolve(_vec(9.0))
+    assert {p["user_id"]: p["samples"] for p in g.profiles()}["legacy"] == 1
+    cfg.face_match_threshold = 0.99
 
     # The household fixes Ana's profile (re-enroll distinct) → next audit clears.
     g.forget("u2")

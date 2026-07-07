@@ -23,6 +23,30 @@ re-architecture.
 | 13 | **Event index → memory-service?** (§9.6/§11.4) | vision-local only (events already reach memory via MQTT) | `app/index_db.EventIndex._to_memory` (empty stub) | If the segment pointer must live in memory-service too, implement the POST in `_to_memory`. |
 | 14 | **Camera zone assignment** — flash-time vs dashboard (§3.3) | dashboard-assigned (recommended; units interchangeable) — **now covers static/.env IP cams too**: they are proxy-declared to the hub each roster sync (`hub_client.declare_camera`), so their zone is a dashboard dropdown like any device; the `@zone@` in `VISION_STATIC_CAMERAS` is only the first-boot/hub-down fallback | hub `/devices-data-set` merges `zone`; roster carries it to the worker | No code change — assign zone in the dashboard after declare. |
 
+## Identity quality overhaul (BUILT 2026-07-07)
+Both david↔ana pollution incidents traced to one root: **embeddings of small/blurry/
+turned-away faces are noise** (a member's own enroll burst self-agreed at cos ~0.2,
+measured on the capture ledger), and every runtime fold into a shared running mean
+(reinforce, promote→enroll) averaged that noise until two members read cos 0.702
+apart and swapped names. Four decisions, all shipped:
+- **Identity abstains below the quality bar.** Engine-enforced det/pose/sharpness
+  gates (`face_quality_reason`) + a size floor (`face_min_px`, applied AFTER the
+  high-res rescue so far faces still get their main-stream upgrade). A gated-out
+  face still counts for occupancy. Enrollment is stricter (`assess_enroll`:
+  exactly-one-face, 110px, yaw≤30) and 422s coach the guided flow.
+- **Profiles are immutable anchor sets.** `anchors` table = individually-stored
+  gated enroll embeddings; matching = top-2 anchor mean (one rogue anchor can't
+  impersonate). Runtime never mutates anchors; reinforce survives for legacy
+  anchor-less members only; first gated enroll RESETS a legacy centroid.
+- **Silent folds must be earned.** Promotion = routing only (never writes `faces`);
+  autoheal needs maturity (`min_sightings`/`min_span_s`/`min_coherence`) — never a
+  single frame. Human review answers stay ungated.
+- **A tripwire watches the one number that mattered.** `app/face_audit.py` (boot +
+  every 6h, `GET /faces/health`, `POST /faces/audit`): member-vs-member max
+  cross-anchor cosine ≥ 0.45 → SMEAR ALARM, all silent folds freeze (self-clears on
+  a healthy pass); promotions re-scored against anchors (detach < 0.30); 24h
+  cluster-churn signal.
+
 ## Footage review + record scope (BUILT 2026-07-04)
 The §9.5 review surface is now built end-to-end (was: recorder + index existed, but no
 way to browse/play archived clips and every camera recorded).
