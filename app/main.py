@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .config import cfg
+from .face_audit import FaceAuditor
 from .ingest import init_ingestion
 from .perception import annotate_face_in_thumb
 from .retention import Janitor
@@ -28,11 +29,12 @@ from .supervisor import Supervisor
 
 _supervisor: Supervisor | None = None
 _janitor: Janitor | None = None
+_face_auditor: FaceAuditor | None = None
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global _supervisor, _janitor
+    global _supervisor, _janitor, _face_auditor
     init_ingestion()
     # Legacy guest thumbs (full-person crops) get their face located lazily at
     # review time — wire the perception-backed annotator into the gallery here so
@@ -42,6 +44,11 @@ async def lifespan(_app: FastAPI):
     _supervisor.start()
     _janitor = Janitor(index)
     _janitor.start()
+    if cfg.face_audit_interval_s > 0:
+        # Gallery audit + smear alarm (face_audit.py): the tripwire that freezes
+        # silent folds when two member profiles start reading confusably alike.
+        _face_auditor = FaceAuditor(gallery)
+        _face_auditor.start()
     print(f"[vision] up on :{cfg.port} (backend={cfg.backend}/{cfg.face_backend}, "
           f"rec={cfg.rec_mode_default}, ingestion={cfg.ingestion_enabled})", flush=True)
     try:
@@ -51,6 +58,8 @@ async def lifespan(_app: FastAPI):
             _supervisor.stop()
         if _janitor:
             _janitor.stop()
+        if _face_auditor:
+            _face_auditor.stop()
 
 
 app = FastAPI(title="home-hub vision-service", lifespan=lifespan)

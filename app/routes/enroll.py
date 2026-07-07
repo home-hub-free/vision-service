@@ -32,6 +32,33 @@ def profiles():
     return {"profiles": gallery.profiles(), "backend": cfg.face_backend}
 
 
+@router.get("/faces/health")
+def faces_health():
+    """The gallery's identity-health tripwire (see app/face_audit.py): live
+    member-vs-member confusability + the last scheduled audit report. The one
+    number to watch is `member_similarity` — distinct people read ~0.0–0.3; both
+    2026-07 pollution incidents sat at 0.45+ for days with nobody looking."""
+    import json as _json
+    last_raw = gallery.get_kv("face_audit_last")
+    return {
+        "member_similarity": gallery.member_similarity(),
+        "folds_frozen": gallery.folds_frozen,
+        "clusters_24h": gallery.clusters_created_since(24.0),
+        "smear_alarm_cos": cfg.face_smear_alarm_cos,
+        "last_audit": _json.loads(last_raw) if last_raw else None,
+    }
+
+
+@router.post("/faces/audit")
+def faces_audit(authorization=Header(None)):
+    """Run a full audit pass NOW (smear alarm + promotion coherence + churn) —
+    the scheduled auditor's logic, on demand, e.g. right after a cleanup or
+    re-enrollment to lift the fold freeze without waiting for the next cycle."""
+    require_user(authorization)  # admin-gated
+    from ..face_audit import run_audit
+    return run_audit(gallery)
+
+
 @router.get("/faces/thresholds")
 def get_thresholds():
     """The recognition thresholds the auto-heal / match / suggest ladder runs on, each

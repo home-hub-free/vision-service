@@ -346,6 +346,22 @@ class Config:
     face_autoheal_min_span_s: float = field(default_factory=lambda: _f("VISION_FACE_AUTOHEAL_MIN_SPAN_S", 600.0))
     face_autoheal_min_coherence: float = field(default_factory=lambda: _f("VISION_FACE_AUTOHEAL_MIN_COHERENCE", 0.45))
 
+    # ── gallery audit + smear alarm (app/face_audit.py — the tripwire) ────────
+    # Both pollution incidents (2026-07-06 cos 0.459, 2026-07-07 cos 0.702) were
+    # visible for DAYS in one number nobody was watching: how similar two members'
+    # profiles read. The auditor recomputes it on a schedule; at/above the alarm bar
+    # it FREEZES every silent fold (autoheal live + read paths) and logs loudly —
+    # distinct people sit ~0.0–0.3 apart, so 0.45 means cross-contamination, and
+    # folding more would only deepen it. The freeze self-clears when a later audit
+    # measures healthy again (post cleanup/re-enroll). The auditor also re-scores
+    # every member promotion against the member's ANCHORS and detaches clusters that
+    # no longer cohere (back to the review queue, re-heal blocked), and reports
+    # 24h cluster churn (a 3-person house creating 150 clusters/day = mush signal).
+    face_audit_interval_s: float = field(default_factory=lambda: _f("VISION_FACE_AUDIT_INTERVAL_S", 21600.0))
+    face_smear_alarm_cos: float = field(default_factory=lambda: _f("VISION_FACE_SMEAR_ALARM_COS", 0.45))
+    face_audit_detach_below: float = field(default_factory=lambda: _f("VISION_FACE_AUDIT_DETACH_BELOW", 0.30))
+    face_churn_warn_24h: int = field(default_factory=lambda: _i("VISION_FACE_CHURN_WARN_24H", 30))
+
     def __post_init__(self) -> None:
         for d in (DATA, self.rec_dir, self.hls_dir):
             os.makedirs(d, exist_ok=True)

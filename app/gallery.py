@@ -217,6 +217,38 @@ class Gallery:
                 conn.close()
         return self.thresholds()
 
+    # ── generic settings kv (audit report, fold freeze) ───────────────────────
+    def get_kv(self, key: str) -> Optional[str]:
+        conn = self._db()
+        try:
+            row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+
+    def set_kv(self, key: str, value: Optional[str]) -> None:
+        """Persist (or, with None, clear) a settings row."""
+        with _lock:
+            conn = self._db()
+            try:
+                if value is None:
+                    conn.execute("DELETE FROM settings WHERE key=?", (key,))
+                else:
+                    conn.execute(
+                        "INSERT INTO settings (key, value) VALUES (?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+                conn.commit()
+            finally:
+                conn.close()
+
+    @property
+    def folds_frozen(self) -> bool:
+        """True while the smear alarm has silent folds frozen (see app/face_audit.py):
+        two member profiles read confusably alike, so autoheal would only deepen the
+        cross-contamination. Human review keeps working; the auditor clears the flag
+        when a later pass measures healthy again."""
+        return self.get_kv("face_folds_frozen") == "1"
+
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, col: str, decl: str) -> None:
         cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -488,6 +520,68 @@ class Gallery:
             if uid == user_id:
                 return s
         return None
+
+    def member_similarity(self) -> List[dict]:
+        """Pairwise member-vs-member confusability — THE smear tripwire. Score =
+        the max cross-anchor cosine between the two profiles (the impersonation
+        risk: it only takes one confusable anchor pair to start swapping names);
+        anchor-less legacy members contribute their centroid. Distinct people sit
+        ~0.0–0.3; both pollution incidents read 0.45+ for days unwatched."""
+        conn = self._db()
+        try:
+            vecs: dict = {}
+            for uid, blob in conn.execute("SELECT user_id, embedding FROM anchors"):
+                vecs.setdefault(uid, []).append(json.loads(blob))
+            for uid, blob in conn.execute("SELECT user_id, embedding FROM faces"):
+                vecs.setdefault(uid, [json.loads(blob)])  # centroid only if no anchors
+        finally:
+            conn.close()
+        ids = sorted(vecs)
+        out = []
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                score = max(_cosine(a, b) for a in vecs[ids[i]] for b in vecs[ids[j]])
+                out.append({"a": ids[i], "b": ids[j], "score": round(score, 3)})
+        out.sort(key=lambda r: -r["score"])
+        return out
+
+    def audit_promotions(self, detach_below: float) -> dict:
+        """Re-score every member promotion against the member's CURRENT profile
+        (anchors) and detach the ones that no longer cohere — back to the review
+        queue with re-heal blocked. Members without anchors are skipped (no ground
+        truth to judge against). Returns {checked, detached:[...]}. """
+        conn = self._db()
+        try:
+            anchored = {r[0] for r in conn.execute("SELECT DISTINCT user_id FROM anchors")}
+            rows = conn.execute(
+                """SELECT guest_id, promoted_user_id, embedding FROM guests
+                   WHERE promoted_user_id IS NOT NULL
+                     AND promoted_user_id NOT LIKE 'guest:%'""").fetchall()
+        finally:
+            conn.close()
+        checked, detached = 0, []
+        for gid, member, blob in rows:
+            if member not in anchored:
+                continue
+            checked += 1
+            score = self._member_score_one(member, json.loads(blob))
+            if score is not None and score < detach_below:
+                if self.detach_cluster(gid):
+                    detached.append({"guest_id": gid, "member": member,
+                                     "score": round(score, 3)})
+        return {"checked": checked, "detached": detached}
+
+    def clusters_created_since(self, hours: float = 24.0) -> int:
+        """Cluster churn: fresh guest clusters in the window. A 3-person household
+        creating 150/day means embeddings aren't matching ANYONE reliably — the
+        mush signal that precedes pollution."""
+        conn = self._db()
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM guests WHERE first_seen >= datetime('now', ?)",
+                (f"-{int(hours * 3600)} seconds",)).fetchone()[0]
+        finally:
+            conn.close()
 
     def _best_household(self, emb: List[float],
                         exclude: Optional[set] = None) -> Tuple[Optional[str], Optional[str], float, float]:
@@ -963,6 +1057,8 @@ class Gallery:
             conn.close()
         if not row or row[2] is not None:
             return None
+        if self.folds_frozen:  # smear alarm: folding would deepen contamination
+            return None
         if not self._heal_eligible(guest_id):
             return None
         kind, tid, tname, score, margin = self._best_identity(
@@ -996,12 +1092,14 @@ class Gallery:
         finally:
             conn.close()
         queue, healed = [], []
+        frozen = self.folds_frozen  # smear alarm: queue keeps working, heals don't
         for gid, name, sightings, first_seen, last_seen, blob, rejected_raw, thumb, box_raw in rows:
             emb = json.loads(blob)
             rejected = self._parse_rejected(rejected_raw)
             kind, tid, tname, score, margin = self._best_identity(
                 emb, exclude=rejected, exclude_guest=gid)
-            if (tid is not None and score >= self._thr("face_autoheal_threshold")
+            if (not frozen
+                    and tid is not None and score >= self._thr("face_autoheal_threshold")
                     and margin >= self._thr("face_autoheal_margin")
                     and self._heal_eligible(gid)):
                 if kind == "member":
