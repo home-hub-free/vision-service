@@ -177,6 +177,11 @@ class Config:
     enroll_max_yaw: float = field(default_factory=lambda: _f("VISION_ENROLL_MAX_YAW", 30.0))
     enroll_max_pitch: float = field(default_factory=lambda: _f("VISION_ENROLL_MAX_PITCH", 25.0))
     enroll_min_sharpness: float = field(default_factory=lambda: _f("VISION_ENROLL_MIN_SHARPNESS", 60.0))
+    # A member's profile is their ANCHOR SET: individually-stored, immutable enroll
+    # embeddings; matching scores against the top-k nearest anchors, and nothing that
+    # happens at runtime (matches, promotions, autoheal) ever mutates them. The cap
+    # keeps the newest N anchors (matching cost + one stale look shouldn't dominate).
+    face_anchor_cap: int = field(default_factory=lambda: _i("VISION_FACE_ANCHOR_CAP", 60))
 
     # Online reinforcement (§4.3): on a confident, UNAMBIGUOUS household match, fold the
     # live embedding into that member's centroid so passive recognition self-improves

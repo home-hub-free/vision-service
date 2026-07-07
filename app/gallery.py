@@ -128,6 +128,22 @@ class Gallery:
                        path        TEXT,
                        thumb_box   TEXT)"""
             )
+            # Anchor set — a member's face profile IS these individually-stored,
+            # quality-gated enroll embeddings. Matching scores a live face against
+            # the top-k nearest anchors; nothing at runtime ever mutates them (the
+            # 2026-07-07 lesson: every "self-improving" fold into a shared running
+            # mean — reinforce, promote — was a pollution channel; a running mean of
+            # noise is what made two members converge to cos 0.702 and swap names).
+            # faces.embedding stays as the derived MEAN of the anchors: a display /
+            # legacy-compat cache, not the matching surface.
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS anchors (
+                       id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                       user_id    TEXT NOT NULL,
+                       embedding  TEXT NOT NULL,
+                       source     TEXT NOT NULL DEFAULT 'enroll',
+                       created_at TEXT NOT NULL DEFAULT (datetime('now')))""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_anchors_user ON anchors(user_id)")
             conn.commit()
         finally:
             conn.close()
@@ -217,19 +233,33 @@ class Gallery:
 
     # ── household enrollment (Face ID — §6 / §5.3) ────────────────────────────
     def enroll(self, user_id: str, name: Optional[str], emb: List[float],
-               thumb: Optional[bytes] = None) -> int:
+               thumb: Optional[bytes] = None, source: str = "enroll") -> int:
+        """Add one quality-gated sample to the member's ANCHOR SET (the profile is
+        the anchors — see _init). The faces-table centroid is recomputed as the plain
+        mean of the anchors, so a member with a legacy (possibly polluted) running-
+        mean centroid and no anchors gets their profile RESET to clean ground truth
+        on their first gated enroll — that's the point, not an accident. Returns the
+        anchor count (= samples)."""
         emb = _normalise(emb)
         self._capture("enroll", emb, thumb, resolved_id=user_id)
         with _lock:
             conn = self._db()
             try:
-                row = conn.execute("SELECT embedding, samples, thumb FROM faces WHERE user_id=?", (user_id,)).fetchone()
+                conn.execute("INSERT INTO anchors (user_id, embedding, source) VALUES (?,?,?)",
+                             (user_id, json.dumps(emb), source))
+                cap = max(1, cfg.face_anchor_cap)
+                conn.execute(
+                    """DELETE FROM anchors WHERE user_id=? AND id NOT IN
+                       (SELECT id FROM anchors WHERE user_id=? ORDER BY id DESC LIMIT ?)""",
+                    (user_id, user_id, cap))
+                anchors = [json.loads(r[0]) for r in conn.execute(
+                    "SELECT embedding FROM anchors WHERE user_id=?", (user_id,))]
+                dim = len(anchors[0])
+                merged = _normalise([sum(a[i] for a in anchors) / len(anchors)
+                                     for i in range(dim)])
+                row = conn.execute("SELECT thumb FROM faces WHERE user_id=?", (user_id,)).fetchone()
                 if row:
-                    merged = _running_mean(json.loads(row[0]), int(row[1]), emb)
-                    samples = int(row[1]) + 1
-                    thumb = thumb or row[2]  # keep the existing face image if none supplied
-                else:
-                    merged, samples = emb, 1
+                    thumb = thumb or row[0]  # keep the existing face image if none supplied
                 conn.execute(
                     """INSERT INTO faces (user_id, name, embedding, samples, thumb, updated_at)
                        VALUES (?,?,?,?,?,datetime('now'))
@@ -237,10 +267,10 @@ class Gallery:
                          name=excluded.name, embedding=excluded.embedding,
                          samples=excluded.samples, thumb=excluded.thumb,
                          updated_at=excluded.updated_at""",
-                    (user_id, name, json.dumps(merged), samples, thumb),
+                    (user_id, name, json.dumps(merged), len(anchors), thumb),
                 )
                 conn.commit()
-                return samples
+                return len(anchors)
             finally:
                 conn.close()
 
@@ -358,20 +388,23 @@ class Gallery:
 
     def rebuild_member(self, user_id: str, embs: List[List[float]],
                        name: Optional[str] = None, thumb: Optional[bytes] = None) -> int:
-        """Re-make the soup: REPLACE a member's centroid with the plain mean of a
-        curated embedding set (same ingredients, less salt). Unlike `enroll`, which
-        running-means new samples into whatever is already in the pot (a seasoned —
-        possibly polluted — centroid barely moves), this discards the old centroid
-        entirely. name/thumb are kept from the existing row unless supplied. Returns
-        the new samples count (= len(embs))."""
+        """Re-make the soup: the curated embedding set BECOMES the member's profile —
+        it replaces the anchor set (newest-cap kept) and the centroid cache is the
+        plain mean. The old anchors/centroid are discarded entirely: rebuild is the
+        human saying "exactly these photos are me". name/thumb are kept from the
+        existing row unless supplied. Returns the new samples count."""
         if not embs:
             raise ValueError("no embeddings to rebuild from")
-        vecs = [_normalise(e) for e in embs]
+        vecs = [_normalise(e) for e in embs][-max(1, cfg.face_anchor_cap):]
         dim = len(vecs[0])
         merged = _normalise([sum(v[i] for v in vecs) / len(vecs) for i in range(dim)])
         with _lock:
             conn = self._db()
             try:
+                conn.execute("DELETE FROM anchors WHERE user_id=?", (user_id,))
+                conn.executemany(
+                    "INSERT INTO anchors (user_id, embedding, source) VALUES (?,?, 'rebuild')",
+                    [(user_id, json.dumps(v)) for v in vecs])
                 row = conn.execute("SELECT name, thumb FROM faces WHERE user_id=?",
                                    (user_id,)).fetchone()
                 keep_name = name if name is not None else (row[0] if row else None)
@@ -390,10 +423,14 @@ class Gallery:
         return len(vecs)
 
     def forget(self, user_id: str) -> None:
+        """Erase a member's face profile — centroid AND anchor set. The capture
+        ledger deliberately survives (it's the permanent archive; rebuild can
+        resurrect a profile from it)."""
         with _lock:
             conn = self._db()
             try:
                 conn.execute("DELETE FROM faces WHERE user_id=?", (user_id,))
+                conn.execute("DELETE FROM anchors WHERE user_id=?", (user_id,))
                 conn.commit()
             finally:
                 conn.close()
@@ -409,6 +446,49 @@ class Gallery:
         finally:
             conn.close()
 
+    @staticmethod
+    def _anchor_score(emb: List[float], anchors: List[List[float]]) -> float:
+        """Mean of the top-2 anchor cosines: max alone would let ONE rogue anchor
+        impersonate the member (the enroll gate checks quality, not identity — a
+        wrong-person photo can still slip in); a full mean would punish legitimate
+        look variety (glasses, beard, lighting). Top-2 demands a second honest
+        agreement, which same-person gated anchors reliably give (they correlate
+        0.55+), while an imposter has to fool two independent enroll shots."""
+        sims = sorted((_cosine(emb, a) for a in anchors), reverse=True)
+        k = min(2, len(sims))
+        return sum(sims[:k]) / k
+
+    def _member_scores(self, emb: List[float],
+                       exclude: Optional[set] = None) -> List[Tuple[float, str, Optional[str]]]:
+        """Every household member scored against an embedding, best first. Members
+        with an anchor set score by top-k anchors (the real matching surface);
+        anchor-less legacy members fall back to their centroid cache."""
+        conn = self._db()
+        try:
+            anchors: dict = {}
+            for uid, blob in conn.execute("SELECT user_id, embedding FROM anchors"):
+                anchors.setdefault(uid, []).append(json.loads(blob))
+            scored = []
+            for uid, name, blob in conn.execute("SELECT user_id, name, embedding FROM faces"):
+                if exclude and uid in exclude:
+                    continue
+                if uid in anchors:
+                    scored.append((self._anchor_score(emb, anchors[uid]), uid, name))
+                else:
+                    scored.append((_cosine(emb, json.loads(blob)), uid, name))
+            scored.sort(key=lambda t: t[0], reverse=True)
+            return scored
+        finally:
+            conn.close()
+
+    def _member_score_one(self, user_id: str, emb: List[float]) -> Optional[float]:
+        """This member's (anchor-aware) score for an embedding, or None if they have
+        no face profile at all (e.g. promoted-only, never enrolled)."""
+        for s, uid, _name in self._member_scores(emb):
+            if uid == user_id:
+                return s
+        return None
+
     def _best_household(self, emb: List[float],
                         exclude: Optional[set] = None) -> Tuple[Optional[str], Optional[str], float, float]:
         """Best household match for an embedding. Returns
@@ -417,37 +497,29 @@ class Gallery:
         one member clearly wins; small when two members score alike). margin is +inf when
         there's only one enrolled member (nothing to confuse it with). `exclude` drops
         members a reviewer already answered "not me" for (review-tier rejections)."""
-        conn = self._db()
-        try:
-            scored = []
-            for uid, name, blob in conn.execute("SELECT user_id, name, embedding FROM faces"):
-                if exclude and uid in exclude:
-                    continue
-                scored.append((_cosine(emb, json.loads(blob)), uid, name))
-            if not scored:
-                return (None, None, -1.0, 0.0)
-            scored.sort(key=lambda t: t[0], reverse=True)
-            best_s, best_uid, best_name = scored[0]
-            margin = best_s - scored[1][0] if len(scored) > 1 else float("inf")
-            return (best_uid, best_name, best_s, margin)
-        finally:
-            conn.close()
+        scored = self._member_scores(emb, exclude)
+        if not scored:
+            return (None, None, -1.0, 0.0)
+        best_s, best_uid, best_name = scored[0]
+        margin = best_s - scored[1][0] if len(scored) > 1 else float("inf")
+        return (best_uid, best_name, best_s, margin)
 
     def _reinforce_household(self, user_id: str, emb: List[float]) -> None:
-        """Online learning: fold a confidently+unambiguously matched LIVE embedding into
-        the member's centroid via running-mean, so passive day-to-day recognition keeps
-        getting sharper without a manual re-enroll. The caller gates this on score/margin
-        (see resolve); here we only bound the influence:
-          * the running-mean weight is capped at `face_reinforce_cap`, so once a member is
-            well-established each new frame nudges the centroid by ≤ 1/(cap+1) (a gentle
-            EMA) — one bad crop can't yank the identity.
-          * `samples` stops incrementing at the cap (purely cosmetic; the centroid keeps
-            adapting). name + thumb are never touched (we keep the deliberate enroll face)."""
+        """Online learning for LEGACY (anchor-less) members only: fold a confident,
+        unambiguous live embedding into the centroid via capped running-mean. A member
+        with an anchor set never reinforces — anchors are immutable ground truth, and
+        every runtime fold into a shared mean was a measured pollution channel (the
+        2026-07-07 lesson); their centroid row is a derived cache the next enroll
+        recomputes, so drifting it would be both risky and pointless."""
         emb = _normalise(emb)
         cap = max(1, cfg.face_reinforce_cap)
         with _lock:
             conn = self._db()
             try:
+                anchored = conn.execute("SELECT 1 FROM anchors WHERE user_id=? LIMIT 1",
+                                        (user_id,)).fetchone()
+                if anchored:
+                    return
                 row = conn.execute("SELECT embedding, samples FROM faces WHERE user_id=?", (user_id,)).fetchone()
                 if not row:
                     return
@@ -472,27 +544,24 @@ class Gallery:
         holds ids (either kind) a reviewer already rejected for this cluster;
         `exclude_guest` keeps a cluster from matching itself."""
         exclude = exclude or set()
+        scored = [(s, "member", uid, name)
+                  for s, uid, name in self._member_scores(emb, exclude)]
         conn = self._db()
         try:
-            scored = []
-            for uid, name, blob in conn.execute("SELECT user_id, name, embedding FROM faces"):
-                if uid in exclude:
-                    continue
-                scored.append((_cosine(emb, json.loads(blob)), "member", uid, name))
             for gid, gname, blob in conn.execute(
                     "SELECT guest_id, name, embedding FROM guests "
                     "WHERE name IS NOT NULL AND promoted_user_id IS NULL"):
                 if gid in exclude or gid == exclude_guest:
                     continue
                 scored.append((_cosine(emb, json.loads(blob)), "guest", gid, gname))
-            if not scored:
-                return (None, None, None, -1.0, 0.0)
-            scored.sort(key=lambda t: t[0], reverse=True)
-            best_s, kind, best_id, best_name = scored[0]
-            margin = best_s - scored[1][0] if len(scored) > 1 else float("inf")
-            return (kind, best_id, best_name, best_s, margin)
         finally:
             conn.close()
+        if not scored:
+            return (None, None, None, -1.0, 0.0)
+        scored.sort(key=lambda t: t[0], reverse=True)
+        best_s, kind, best_id, best_name = scored[0]
+        margin = best_s - scored[1][0] if len(scored) > 1 else float("inf")
+        return (kind, best_id, best_name, best_s, margin)
 
     # ── guest clustering (§4.3 / §11.7) ───────────────────────────────────────
     def _cluster_guest(self, emb: List[float], thumb: Optional[bytes] = None,
@@ -692,7 +761,6 @@ class Gallery:
         carries its captured thumb + how well it still matches the member's centroid
         (`score`), so a reviewer can spot an outlier the thresholds got wrong and detach
         it. Ordered worst-match first (the likeliest mistakes float to the top)."""
-        member = self._best_member_embedding(user_id)
         conn = self._db()
         try:
             rows = conn.execute(
@@ -705,7 +773,8 @@ class Gallery:
         out = []
         for gid, blob, sightings, thumb, box_raw, first_seen, last_seen in rows:
             emb = json.loads(blob)
-            score = round(_cosine(emb, member), 3) if member else None
+            score = self._member_score_one(user_id, emb)
+            score = round(score, 3) if score is not None else None
             # Which face the thumb is about (legacy full-person crops hold several) —
             # located up front on capture, or lazily here for old thumbs; so the
             # full-image viewer can ring exactly this cluster's face.
@@ -719,14 +788,6 @@ class Gallery:
             })
         out.sort(key=lambda r: (r["score"] is None, r["score"] if r["score"] is not None else 0.0))
         return out
-
-    def _best_member_embedding(self, user_id: str) -> Optional[List[float]]:
-        conn = self._db()
-        try:
-            row = conn.execute("SELECT embedding FROM faces WHERE user_id=?", (user_id,)).fetchone()
-        finally:
-            conn.close()
-        return json.loads(row[0]) if row else None
 
     def detach_cluster(self, guest_id: str) -> Optional[str]:
         """"This one wasn't me." Reverse a promote/auto-heal of a HOUSEHOLD member:
@@ -1034,8 +1095,7 @@ class Gallery:
             # does NOT need to clear the absolute match threshold (the whole point of
             # the promoted path is the far/angled camera that never will); it only
             # must not be in a dead heat with someone else.
-            own_emb = self._best_member_embedding(promoted)
-            own = _cosine(emb, own_emb) if own_emb is not None else None
+            own = self._member_score_one(promoted, emb)
             o_uid, _o_name, o_score, _ = self._best_household(emb, exclude={promoted})
             ambiguous = (own is not None and o_uid is not None
                          and own - o_score < self._thr("face_match_margin"))

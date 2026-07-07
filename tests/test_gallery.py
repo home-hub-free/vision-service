@@ -126,20 +126,37 @@ def test_promoted_guest_drops_from_people_and_carries_face():
         conn.close()
 
 
-def test_online_reinforcement_strengthens_household_on_confident_match():
+def test_anchored_member_profile_is_immutable_at_runtime():
+    """The 2026-07-07 invariant: an enrolled member's profile is their anchor set,
+    and NOTHING that happens at runtime mutates it — a confident match answers as
+    them but folds nothing (every runtime fold into a shared mean was a measured
+    pollution channel). Legacy anchor-less members (pre-anchor DBs) keep the old
+    capped-running-mean reinforcement until their first gated enroll resets them."""
     cfg.face_match_threshold = 0.3
     cfg.face_reinforce = True
     cfg.face_reinforce_threshold = 0.5
     cfg.face_reinforce_margin = 0.05
     cfg.face_reinforce_cap = 50
     g = _g()
-    g.enroll("u1", "David", _vec(1.0))            # samples = 1
+    g.enroll("u1", "David", _vec(1.0))            # anchors = 1
     assert g.profiles()[0]["samples"] == 1
+    before = g._member_score_one("u1", _vec(1.0))
     ident = g.resolve(_vec(1.0))                  # confident match, sole member (margin=inf)
     assert ident.cls == "household" and ident.id == "u1"
-    assert g.profiles()[0]["samples"] == 2        # ← passive recognition reinforced the centroid
-    g.resolve(_vec(1.0))
-    assert g.profiles()[0]["samples"] == 3        # keeps self-improving on each confident sighting
+    assert g.profiles()[0]["samples"] == 1        # anchors untouched by a live match
+    assert g._member_score_one("u1", _vec(1.0)) == before
+
+    # Legacy member: a faces row with NO anchors (old DB) still self-improves.
+    conn = g._db()
+    try:
+        conn.execute("INSERT INTO faces (user_id, name, embedding, samples) VALUES (?,?,?,1)",
+                     ("legacy", "Old", __import__('json').dumps(_vec(9.0))))
+        conn.commit()
+    finally:
+        conn.close()
+    g.resolve(_vec(9.0))
+    profiles = {p["user_id"]: p["samples"] for p in g.profiles()}
+    assert profiles["legacy"] == 2                # old-style reinforcement preserved
 
 
 def test_reinforcement_skips_ambiguous_match_and_respects_toggle():

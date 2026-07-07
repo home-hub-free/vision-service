@@ -149,10 +149,11 @@ def test_wrongly_promoted_cluster_stays_anonymous_and_never_reinforces():
     assert ana_after == ana_before     # Ana's centroid untouched by David's face
 
 
-def test_rightly_promoted_cluster_still_answers_and_reinforces_with_other_members_present():
+def test_rightly_promoted_cluster_still_answers_with_other_members_present():
     """The legit far-camera case must keep working when the household has several
     members: the promoted member wins the live embedding decisively (just not the
-    absolute threshold) → answer as them + reinforce."""
+    absolute threshold) → answer as them. Their anchor profile stays untouched —
+    the promoted CLUSTER's own centroid carries that camera's look."""
     cfg.face_match_threshold = 0.99
     cfg.face_match_margin = 0.05
     cfg.guest_cluster_threshold = 0.9
@@ -171,4 +172,4 @@ def test_rightly_promoted_cluster_still_answers_and_reinforces_with_other_member
     ident = g.resolve(probe)
     assert ident.cls == "household" and ident.id == "u2" and ident.name == "Ana"
     after = {p["user_id"]: p["samples"] for p in g.profiles()}["u2"]
-    assert after == before + 1         # convergence reinforcement preserved
+    assert after == before              # anchors are immutable at runtime
