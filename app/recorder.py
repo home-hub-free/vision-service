@@ -36,6 +36,23 @@ def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+# Passthrough supervision: a dead codec-copy ffmpeg is retried on this backoff.
+# Found live 2026-07-08: mc200's ffmpeg died ~2s after service boot (transient RTSP
+# refusal while the substream reader was also connecting) and nothing ever restarted
+# it — the entrance camera silently recorded NOTHING for 4 days.
+RETRY_MIN_S = 10.0
+RETRY_MAX_S = 120.0
+# A run this long means the stream was healthy — reset the backoff ladder.
+HEALTHY_RUN_S = 60.0
+
+# moov at the FRONT of each finished segment (faststart): without it the browser
+# has to Range-hunt the index at the tail of a ~40MB file before it can start or
+# seek — the "clips take forever to load" complaint. The flag must ride INSIDE the
+# tee slot (segment_format_options) — a top-level -movflags never reaches a muxer
+# wrapped by tee.
+SEG_OPTS = "segment_format_options=movflags=+faststart"
+
+
 def rtsp_copy_args(url: str, seg_out: str, hls_out: str,
                    transport: str = "tcp", segment_seconds: int = 300) -> list:
     """ffmpeg argv: pull an RTSP MAIN stream and record it by **codec-copy** (no decode,
@@ -47,7 +64,7 @@ def rtsp_copy_args(url: str, seg_out: str, hls_out: str,
     hold by copy, so audio alone is transcoded to AAC — negligible CPU next to the
     video copy; the `0:a:0?` optional map keeps audio-less cameras working."""
     tee = (
-        f"[f=segment:strftime=1:segment_time={segment_seconds}:reset_timestamps=1]{seg_out}"
+        f"[f=segment:strftime=1:segment_time={segment_seconds}:reset_timestamps=1:{SEG_OPTS}]{seg_out}"
         f"|[f=hls:hls_time=2:hls_list_size=20:"
         f"hls_flags=delete_segments+append_list+independent_segments:hls_segment_type=fmp4]{hls_out}"
     )
@@ -95,6 +112,12 @@ class Recorder:
         self.fps = cfg.rec_fps
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
+        # Passthrough supervision state: `_want` is the operator intent (start() set
+        # it, stop() clears it — privacy/shutdown must never be un-done by a retry).
+        self._want = False
+        self._retry_at = 0.0
+        self._backoff = RETRY_MIN_S
+        self._opened_at = 0.0
         # Pre-roll ring buffer (gated): keep ~preroll_seconds of recent frames.
         self._ring: Deque[Tuple[float, bytes]] = collections.deque(maxlen=max(1, int(cfg.preroll_seconds * self.fps)))
         self._last_present = 0.0
@@ -104,8 +127,9 @@ class Recorder:
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
     def start(self) -> None:
+        self._want = self.mode != "off"
         if self._passthrough:
-            if self.mode != "off":
+            if self._want:
                 self._open_passthrough()
             return
         if self.mode == "continuous":
@@ -122,16 +146,41 @@ class Recorder:
             hls_out = os.path.join(self.hls_dir, "live.m3u8")
             args = rtsp_copy_args(self.record_url, seg_out, hls_out,
                                   cfg.rtsp_transport, cfg.segment_seconds)
+            # stderr → a small per-camera log (truncated each run): DEVNULL is how
+            # mc200's death stayed invisible for 4 days. Never *.mp4-shaped, so the
+            # footage sync ignores it.
+            try:
+                stderr_f = open(self._stderr_path(), "wb")
+            except OSError:
+                stderr_f = subprocess.DEVNULL
             try:
                 # No stdin: ffmpeg pulls the RTSP stream itself (we don't feed frames).
                 self._proc = subprocess.Popen(args, stdin=subprocess.DEVNULL,
-                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                              stdout=subprocess.DEVNULL, stderr=stderr_f)
+                self._opened_at = time.time()
             except Exception as e:  # noqa: BLE001
                 print(f"[vision] recorder({self.cam_id}) rtsp-copy start failed: {e}", flush=True)
                 self._proc = None
+            finally:
+                if stderr_f is not subprocess.DEVNULL:
+                    stderr_f.close()  # child holds its own dup
 
     def stop(self) -> None:
+        self._want = False
         self._close()
+
+    def _stderr_path(self) -> str:
+        return os.path.join(self.rec_dir, "ffmpeg.log")
+
+    def _stderr_tail(self, max_bytes: int = 500) -> str:
+        try:
+            with open(self._stderr_path(), "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - max_bytes))
+                text = f.read().decode("utf-8", "replace").strip()
+            return " | ".join(text.splitlines()[-3:]) or "(empty)"
+        except OSError:
+            return "(no stderr log)"
 
     def clear_ring(self) -> None:
         """Drop the pre-roll ring (privacy pause): frames buffered before the pause
@@ -148,14 +197,14 @@ class Recorder:
             seg_out = os.path.join(self.rec_dir, "%Y%m%d-%H%M%S.mp4")
             hls_out = os.path.join(self.hls_dir, "live.m3u8")
             tee = (
-                f"[f=segment:strftime=1:segment_time={cfg.segment_seconds}:reset_timestamps=1]{seg_out}"
+                f"[f=segment:strftime=1:segment_time={cfg.segment_seconds}:reset_timestamps=1:{SEG_OPTS}]{seg_out}"
                 f"|[f=hls:hls_time=2:hls_list_size=20:"
                 f"hls_flags=delete_segments+append_list+independent_segments:hls_segment_type=fmp4]{hls_out}"
             )
             args = ["ffmpeg", "-hide_banner", "-loglevel", "error",
                     "-f", "mjpeg", "-fflags", "+genpts", "-r", str(self.fps), "-i", "pipe:0",
                     *_encode_args(cfg.rec_encoder, self.fps),
-                    "-movflags", "+faststart", "-map", "0:v",
+                    "-map", "0:v",
                     "-f", "tee", tee]
             try:
                 self._proc = subprocess.Popen(args, stdin=subprocess.PIPE,
@@ -223,8 +272,41 @@ class Recorder:
                 self._open()
 
     def tick(self) -> None:
-        """Periodic: close a gated recording once nobody's been present for a tail."""
+        """Periodic (called from the reader at frame rate): supervise the passthrough
+        ffmpeg, or close a gated recording once nobody's been present for a tail."""
+        if self._passthrough:
+            self._supervise_passthrough()
+            return
         if self.mode in ("off", "continuous") or self._proc is None:
             return
         if time.time() - self._last_present > self._tail_s:
             self._close()
+
+    def _supervise_passthrough(self) -> None:
+        """Keep the codec-copy ffmpeg alive: reap + relaunch (with backoff) when it
+        dies. Only while `_want` — a privacy stop() must stay stopped. tick() runs
+        from the reader, which is paused during privacy, so this can't even race it."""
+        if not self._want:
+            return
+        proc = self._proc
+        now = time.time()
+        if proc is not None:
+            rc = proc.poll()  # also reaps — no more <defunct> encoders
+            if rc is None:
+                return
+            with self._lock:
+                if self._proc is proc:
+                    self._proc = None
+            ran = now - self._opened_at
+            self._backoff = RETRY_MIN_S if ran >= HEALTHY_RUN_S \
+                else min(RETRY_MAX_S, self._backoff * 2)
+            self._retry_at = now + self._backoff
+            print(f"[vision] recorder({self.cam_id}) rtsp-copy exited rc={rc} "
+                  f"after {ran:.0f}s; retry in {self._backoff:.0f}s; "
+                  f"stderr: {self._stderr_tail()}", flush=True)
+            return
+        if now >= self._retry_at:
+            self._open_passthrough()
+            if self._proc is None:  # spawn itself failed — back off before the next try
+                self._backoff = min(RETRY_MAX_S, self._backoff * 2)
+                self._retry_at = now + self._backoff
