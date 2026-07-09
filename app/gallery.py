@@ -106,6 +106,15 @@ class Gallery:
             # NULL = not known yet (legacy thumb, annotated lazily); "[]" = the engine
             # looked and found no face (don't re-run).
             self._ensure_column(conn, "guests", "thumb_box", "TEXT")
+            # Who promoted this cluster into its member: 'human' (a deliberate "yes,
+            # it's me" from the review flow) or 'auto' (autoheal folded it in). The
+            # scheduled auditor re-scores promotions against anchors and detaches the
+            # ones that drift below the coherence bar — but it must only ever undo its
+            # OWN work: silently reverting a human answer (and re-queuing the card)
+            # created a detach↔re-confirm loop the household could never win (measured
+            # 2026-07-08: 118 auto-detaches vs 184 re-promotes on the same cards).
+            # NULL (legacy rows) is treated as human — sticky, never auto-detached.
+            self._ensure_column(conn, "guests", "promoted_by", "TEXT")
             # Runtime-adjustable recognition thresholds (the auto-heal/match/suggest
             # knobs). Empty = use the config.py/env defaults; a row overrides it live so
             # the household can tune from Settings without a redeploy. See `thresholds()`.
@@ -147,6 +156,42 @@ class Gallery:
             conn.commit()
         finally:
             conn.close()
+        self._migrate_clear_self_rejections()
+
+    def _migrate_clear_self_rejections(self) -> None:
+        """One-time repair: a promoted cluster must never list its OWN member in its
+        rejected set. That contradiction ("this IS David" + "David said not-me") was
+        minted by the old loop — the auditor's statistical detach stamped the member
+        as rejected, then the human re-promoted without clearing it (measured
+        2026-07-08: 24 rows). A promote is the newer, authoritative human statement,
+        so the rejection loses. Idempotent (guarded by a kv marker; promote_guest now
+        clears on every confirm, so no new contradictions can form)."""
+        if self.get_kv("promoted_self_reject_cleanup") == "1":
+            return
+        fixed = 0
+        with _lock:
+            conn = self._db()
+            try:
+                rows = conn.execute(
+                    """SELECT guest_id, promoted_user_id, rejected_user_ids FROM guests
+                       WHERE promoted_user_id IS NOT NULL
+                         AND rejected_user_ids IS NOT NULL AND rejected_user_ids != '[]'"""
+                ).fetchall()
+                for gid, member, rejected_raw in rows:
+                    rejected = self._parse_rejected(rejected_raw)
+                    if member in rejected:
+                        rejected.discard(member)
+                        conn.execute(
+                            "UPDATE guests SET rejected_user_ids=? WHERE guest_id=?",
+                            (json.dumps(sorted(rejected)), gid))
+                        fixed += 1
+                conn.commit()
+            finally:
+                conn.close()
+        self.set_kv("promoted_self_reject_cleanup", "1")
+        if fixed:
+            print(f"[vision] cleared self-rejection on {fixed} promoted cluster(s)",
+                  flush=True)
 
     # ── runtime-adjustable thresholds (Settings ▸ Face recognition) ───────────
     # Name → config.py default. These are the levers that decide how eagerly a live
@@ -546,17 +591,27 @@ class Gallery:
         return out
 
     def audit_promotions(self, detach_below: float) -> dict:
-        """Re-score every member promotion against the member's CURRENT profile
-        (anchors) and detach the ones that no longer cohere — back to the review
-        queue with re-heal blocked. Members without anchors are skipped (no ground
-        truth to judge against). Returns {checked, detached:[...]}. """
+        """Re-score AUTO-promotions (autoheal) against the member's CURRENT profile
+        (anchors) and detach the ones that no longer cohere — back to the review queue
+        WITHOUT a reject mark (a low score is not a human "not me", so the card can be
+        suggested again once it sharpens). Members without anchors are skipped (no
+        ground truth to judge against). Returns {checked, detached:[...]}.
+
+        Human promotions ('yes, it's me' from review; and legacy rows with a NULL
+        source, treated as human) are deliberately NOT auto-detached — silently
+        undoing a person's answer and re-queuing the card is a loop they can't win
+        (2026-07-08). A human promotion that drifts is instead neutralised at RESOLVE
+        time by the coherence floor (a live face too weak to cohere never speaks for
+        the member — see resolve/face_promoted_min_coherence), and the audit trail in
+        member_clusters() still surfaces it for a manual detach."""
         conn = self._db()
         try:
             anchored = {r[0] for r in conn.execute("SELECT DISTINCT user_id FROM anchors")}
             rows = conn.execute(
                 """SELECT guest_id, promoted_user_id, embedding FROM guests
                    WHERE promoted_user_id IS NOT NULL
-                     AND promoted_user_id NOT LIKE 'guest:%'""").fetchall()
+                     AND promoted_user_id NOT LIKE 'guest:%'
+                     AND promoted_by = 'auto'""").fetchall()
         finally:
             conn.close()
         checked, detached = 0, []
@@ -566,7 +621,7 @@ class Gallery:
             checked += 1
             score = self._member_score_one(member, json.loads(blob))
             if score is not None and score < detach_below:
-                if self.detach_cluster(gid):
+                if self.detach_cluster(gid, reject=False):
                     detached.append({"guest_id": gid, "member": member,
                                      "score": round(score, 3)})
         return {"checked": checked, "detached": detached}
@@ -598,16 +653,22 @@ class Gallery:
         margin = best_s - scored[1][0] if len(scored) > 1 else float("inf")
         return (best_uid, best_name, best_s, margin)
 
-    def _reinforce_household(self, user_id: str, emb: List[float]) -> None:
+    def _reinforce_household(self, user_id: str, emb: List[float]) -> bool:
         """Online learning for LEGACY (anchor-less) members only: fold a confident,
         unambiguous live embedding into the centroid via capped running-mean. A member
         with an anchor set never reinforces — anchors are immutable ground truth, and
         every runtime fold into a shared mean was a measured pollution channel (the
         2026-07-07 lesson); their centroid row is a derived cache the next enroll
         recomputes, so drifting it would be both risky and pointless. The smear
-        freeze covers this fold too — "every silent fold" means every one."""
+        freeze covers this fold too — "every silent fold" means every one.
+
+        Returns True iff a fold actually happened, so the caller records the ledger's
+        `reinforced` flag honestly — for an anchored member (the normal case now) this
+        is a no-op and the flag must read False (2026-07-08: the flag was being set
+        from the caller's INTENT before this no-op, mislabelling folds that never
+        occurred)."""
         if self.folds_frozen:
-            return
+            return False
         emb = _normalise(emb)
         cap = max(1, cfg.face_reinforce_cap)
         with _lock:
@@ -616,10 +677,10 @@ class Gallery:
                 anchored = conn.execute("SELECT 1 FROM anchors WHERE user_id=? LIMIT 1",
                                         (user_id,)).fetchone()
                 if anchored:
-                    return
+                    return False
                 row = conn.execute("SELECT embedding, samples FROM faces WHERE user_id=?", (user_id,)).fetchone()
                 if not row:
-                    return
+                    return False
                 cur = int(row[1])
                 merged = _running_mean(json.loads(row[0]), min(cur, cap), emb)
                 samples = cur + 1 if cur < cap else cur
@@ -628,6 +689,7 @@ class Gallery:
                     (json.dumps(merged), samples, user_id),
                 )
                 conn.commit()
+                return True
             finally:
                 conn.close()
 
@@ -824,7 +886,7 @@ class Gallery:
             conn.close()
 
     def promote_guest(self, guest_id: str, user_id: str, name: Optional[str],
-                      carry_thumb: bool = True) -> bool:
+                      carry_thumb: bool = True, promoted_by: str = "human") -> bool:
         """Promote a guest cluster into a household member — a ROUTING decision only:
         the cluster is tagged promoted (it stops surfacing for review, and resolve
         answers as that member on a cluster match), but it NEVER folds into the
@@ -837,16 +899,30 @@ class Gallery:
         its OWN centroid. The faces table is never written here at all — a member
         with no enroll portrait borrows a promoted cluster's crop at read time
         (get_thumb), so `carry_thumb` no longer copies anything (kept for caller
-        compatibility)."""
+        compatibility).
+
+        `promoted_by` records the source: 'human' (a deliberate review-flow confirm —
+        sticky, the auditor never auto-reverts it) or 'auto' (autoheal). A human
+        confirm also CLEARS this member from the cluster's rejected set: a "yes, it's
+        me" is the newer, authoritative statement and must win over any earlier
+        auditor-stamped or reviewer "not-me" — otherwise the cluster is left both
+        promoted-to and rejected-by the same member (the self-contradiction the
+        2026-07-08 loop minted)."""
         del carry_thumb  # thumb lending moved to get_thumb (read time)
         with _lock:
             conn = self._db()
             try:
-                row = conn.execute("SELECT guest_id FROM guests WHERE guest_id=?", (guest_id,)).fetchone()
+                row = conn.execute(
+                    "SELECT rejected_user_ids FROM guests WHERE guest_id=?",
+                    (guest_id,)).fetchone()
                 if not row:
                     return False
-                conn.execute("UPDATE guests SET promoted_user_id=?, name=? WHERE guest_id=?",
-                             (user_id, name, guest_id))
+                rejected = self._parse_rejected(row[0])
+                rejected.discard(user_id)
+                conn.execute(
+                    """UPDATE guests SET promoted_user_id=?, name=?, promoted_by=?,
+                           rejected_user_ids=? WHERE guest_id=?""",
+                    (user_id, name, promoted_by, json.dumps(sorted(rejected)), guest_id))
                 conn.commit()
             finally:
                 conn.close()
@@ -886,14 +962,20 @@ class Gallery:
         out.sort(key=lambda r: (r["score"] is None, r["score"] if r["score"] is not None else 0.0))
         return out
 
-    def detach_cluster(self, guest_id: str) -> Optional[str]:
+    def detach_cluster(self, guest_id: str, reject: bool = True) -> Optional[str]:
         """"This one wasn't me." Reverse a promote/auto-heal of a HOUSEHOLD member:
-        clear the promotion + name so the cluster re-enters the review queue, and
-        record the member in the cluster's rejected set so it never auto-heals back.
+        clear the promotion + name so the cluster re-enters the review queue.
         Nothing to un-merge anymore: promotions stopped folding into the member
         centroid (see promote_guest) — the member profile was never touched.
         Returns the member id it was detached from, or None if the cluster isn't a
-        member promotion (missing, or merged into a NAMED guest — handled elsewhere)."""
+        member promotion (missing, or merged into a NAMED guest — handled elsewhere).
+
+        `reject` controls whether the member is added to the cluster's rejected set
+        (never suggested / auto-healed back). A HUMAN "not me" (default) is a real
+        rejection and should stick. The scheduled auditor's statistical detach passes
+        `reject=False`: a low coherence score is not a person saying "that isn't me",
+        and marking it as one both mislabels the reject set AND (pre-2026-07-08)
+        suppressed the suggest tier so the re-queued card came back unanswerable."""
         with _lock:
             conn = self._db()
             try:
@@ -906,10 +988,11 @@ class Gallery:
                 if member.startswith("guest:"):
                     return None  # merged into a NAMED guest, not a member — not our case
                 rejected = self._parse_rejected(row[2])
-                rejected.add(member)
+                if reject:
+                    rejected.add(member)
                 conn.execute(
-                    """UPDATE guests SET promoted_user_id=NULL, name=NULL, rejected_user_ids=?,
-                           last_seen=datetime('now') WHERE guest_id=?""",
+                    """UPDATE guests SET promoted_user_id=NULL, name=NULL, promoted_by=NULL,
+                           rejected_user_ids=?, last_seen=datetime('now') WHERE guest_id=?""",
                     (json.dumps(sorted(rejected)), guest_id))
                 conn.commit()
                 return member
@@ -1071,7 +1154,7 @@ class Gallery:
                 or margin < self._thr("face_autoheal_margin")):
             return None
         if kind == "member":
-            self.promote_guest(guest_id, tid, tname, carry_thumb=False)
+            self.promote_guest(guest_id, tid, tname, carry_thumb=False, promoted_by="auto")
         elif self.merge_guests(guest_id, tid) is None:
             return None
         return kind, tid, tname, score
@@ -1106,7 +1189,7 @@ class Gallery:
                     and margin >= self._thr("face_autoheal_margin")
                     and self._heal_eligible(gid)):
                 if kind == "member":
-                    self.promote_guest(gid, tid, tname, carry_thumb=False)
+                    self.promote_guest(gid, tid, tname, carry_thumb=False, promoted_by="auto")
                 else:
                     self.merge_guests(gid, tid)
                 healed.append({"guest_id": gid, "kind": kind, "id": tid,
@@ -1117,6 +1200,15 @@ class Gallery:
                 suggested = {"kind": kind, "id": tid, "name": tname,
                              "score": round(score, 3)}
             face_box, no_face = self._face_box_for(gid, thumb, box_raw, emb)
+            # Don't queue an unanswerable single blip: a cluster seen exactly once whose
+            # only crop has no locatable face (no_face — the detector looked and found
+            # nothing). There's nothing a human can identify, and it isn't a recurring
+            # person worth holding for review; if they come back it clusters (sightings
+            # ≥2), its thumb self-heals on the next face-located sighting, and it
+            # surfaces then. This is most of the churn the 2026-07-08 audit flagged
+            # (blurry/cut-off captures the household kept being asked "who is this?").
+            if no_face and sightings <= 1:
+                continue
             queue.append({
                 "guest_id": gid,
                 "label": self.default_label(gid),
@@ -1206,11 +1298,13 @@ class Gallery:
         if (uid is not None and score >= match_thr
                 and margin >= self._thr("face_match_margin")):
             # Self-improve on a confident + unambiguous match (gated to prevent drift).
-            reinforced = (cfg.face_reinforce
-                          and score >= self._thr("face_reinforce_threshold")
-                          and margin >= self._thr("face_reinforce_margin"))
-            if reinforced:
-                self._reinforce_household(uid, emb)
+            # `reinforced` reflects an ACTUAL fold: _reinforce_household is a no-op for
+            # anchored members (the normal case) and when folds are frozen, so the
+            # ledger flag must come from its return, not from the eligibility intent.
+            eligible = (cfg.face_reinforce
+                        and score >= self._thr("face_reinforce_threshold")
+                        and margin >= self._thr("face_reinforce_margin"))
+            reinforced = eligible and self._reinforce_household(uid, emb)
             self._capture("match", emb, thumb, thumb_box, resolved_id=uid,
                           score=score, reinforced=reinforced)
             return Identity(id=uid, name=name, cls="household",
@@ -1242,20 +1336,31 @@ class Gallery:
             o_uid, _o_name, o_score, _ = self._best_household(emb, exclude={promoted})
             ambiguous = (own is not None and o_uid is not None
                          and own - o_score < self._thr("face_match_margin"))
-            if ambiguous:
+            # Absolute coherence floor: beating the OTHER members isn't enough — the
+            # live face must actually look like this member. A junk-embedding cluster
+            # the human confirmed from a blurry card (own ~0.05), or a promoted cluster
+            # that has drifted onto someone else, beats the (also-low) other members on
+            # margin alone and would stamp the member's name on a stranger. Below the
+            # floor we decline the name and answer as an anonymous sighting. The floor
+            # sits well under match_threshold so the legit far/angled camera still
+            # resolves (measured 2026-07-08: workhorse cluster ~0.55, far-couch ~0.44;
+            # the noise leak was <0.20).
+            incoherent = own is not None and own < self._thr("face_promoted_min_coherence")
+            if ambiguous or incoherent:
                 # Answer as an anonymous guest sighting — "someone is here", no name —
-                # instead of asserting a 50/50 identity. The 20s re-verify upgrades the
-                # label as soon as a frame reads decisively.
+                # instead of asserting an identity the live face doesn't support. The
+                # 20s re-verify upgrades the label as soon as a frame reads decisively.
                 self._capture("ambiguous", emb, thumb, thumb_box, cluster_id=gid,
                               score=cscore)
                 return Identity(id=gid, name=None, cls="guest",
                                 confidence=min(0.6, 0.3 + 0.05 * sightings))
-            reinforced = (cfg.face_reinforce
-                          and cscore >= self._thr("face_reinforce_threshold")
-                          and (own is None or o_uid is None
-                               or own - o_score >= self._thr("face_reinforce_margin")))
-            if reinforced:
-                self._reinforce_household(promoted, emb)
+            # `reinforced` reflects an ACTUAL fold — no-op for anchored members and when
+            # frozen (see match path); take it from the return, not the intent.
+            eligible = (cfg.face_reinforce
+                        and cscore >= self._thr("face_reinforce_threshold")
+                        and (own is None or o_uid is None
+                             or own - o_score >= self._thr("face_reinforce_margin")))
+            reinforced = eligible and self._reinforce_household(promoted, emb)
             self._capture("promoted", emb, thumb, thumb_box, resolved_id=promoted,
                           cluster_id=gid, score=cscore, reinforced=reinforced)
             return Identity(id=promoted, name=gname, cls="household",

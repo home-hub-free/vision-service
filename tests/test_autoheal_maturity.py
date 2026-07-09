@@ -115,11 +115,15 @@ def test_incoherent_cluster_goes_to_review_not_autoheal():
 
 def test_human_promotion_is_never_maturity_gated():
     """The tinder-flow "yes, that's me" is a deliberate answer — it works on a
-    single-sighting cluster (promotion is routing-only; nothing folds)."""
+    single-sighting cluster (autoheal's maturity bars don't apply; promotion is
+    routing-only, nothing folds). The live face must still cohere with the member for
+    the promotion to SPEAK — as a real "it's me" confirm of one's own far/angled face
+    does (a David-ish look here) — see the coherence-floor test for the junk case."""
     _tiers()
     g = _g()
     g.enroll("u1", "David", _vec(1.0))
-    g.resolve(_vec(7.0))                      # brand-new single-sighting cluster
+    probe = _mix(1.0, 7.0, 0.5)               # David-ish far look, above the floor
+    g.resolve(probe)                          # brand-new single-sighting cluster
     assert g.promote_guest("guest:1", "u1", "David")
-    ident = g.resolve(_vec(7.0))
+    ident = g.resolve(probe)
     assert ident.cls == "household" and ident.id == "u1"

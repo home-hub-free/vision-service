@@ -9,9 +9,13 @@ schedule and acts:
   read paths) via the gallery's `face_folds_frozen` flag and logs loudly. Human
   review keeps working. The freeze self-clears when a later pass measures healthy
   (post cleanup / re-enroll) — no manual unfreeze to forget about.
-* PROMOTION COHERENCE — every cluster promoted into a member is re-scored against
-  the member's CURRENT anchors; ones that no longer cohere are detached back to the
-  review queue (re-heal blocked by the rejected mark).
+* PROMOTION COHERENCE — every AUTO-promotion (autoheal) is re-scored against the
+  member's CURRENT anchors; ones that no longer cohere are detached back to the
+  review queue (no reject mark — a low score is not a human "not me", so the card can
+  be suggested again once it sharpens). HUMAN "yes, it's me" confirms are never
+  auto-detached: silently undoing a person's answer and re-queuing the card was a
+  loop they could not win (2026-07-08). A drifted human promotion is neutralised at
+  resolve time by the coherence floor instead (it stops speaking for the member).
 * CHURN — fresh clusters per 24h. A 3-person household creating 150/day means
   embeddings match nobody reliably (the mush signal that precedes pollution).
 

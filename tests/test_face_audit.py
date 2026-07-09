@@ -88,26 +88,35 @@ def test_smear_alarm_freezes_folds_and_self_clears():
     assert g.resolve(probe).cls == "household"      # folds work again
 
 
-def test_promotion_audit_detaches_incoherent_clusters():
+def test_promotion_audit_detaches_incoherent_auto_promotions_only():
+    """The auditor undoes its OWN work (autoheal), never a human's answer. An
+    incoherent AUTO-promotion is detached back to review WITHOUT a reject mark (a low
+    score is not a human "not me", so it can be suggested again once it sharpens); an
+    incoherent HUMAN confirm is left attached — silently re-queuing a person's answer
+    was the 2026-07-08 loop; the resolve-time coherence floor neutralises it instead."""
     _defaults()
     g = _g()
     g.enroll("u1", "David", _vec(1.0))
-    g.resolve(_mix(1.0, 2.0, 0.95))                 # guest:1 — David-like
-    g.resolve(_vec(7.0))                            # guest:2 — nothing like David
-    assert g.promote_guest("guest:1", "u1", "David")
-    assert g.promote_guest("guest:2", "u1", "David")  # the wrong human answer
+    g.resolve(_vec(7.0))                             # guest:1 — nothing like David
+    g.resolve(_vec(8.0))                             # guest:2 — nothing like David
+    assert g.promote_guest("guest:1", "u1", "David", promoted_by="auto")
+    assert g.promote_guest("guest:2", "u1", "David")   # human "yes it's me" (wrong, sticky)
     report = run_audit(g)
     detached = {d["guest_id"] for d in report["promotions_detached"]}
-    assert detached == {"guest:2"}
-    # detached cluster is blocked from re-healing into David and back in review
+    assert detached == {"guest:1"}                   # only the auto one
+    import json as _json
     conn = g._db()
     try:
-        rej, promoted = conn.execute(
-            "SELECT rejected_user_ids, promoted_user_id FROM guests WHERE guest_id='guest:2'"
+        rej1, prom1 = conn.execute(
+            "SELECT rejected_user_ids, promoted_user_id FROM guests WHERE guest_id='guest:1'"
         ).fetchone()
+        prom2 = conn.execute(
+            "SELECT promoted_user_id FROM guests WHERE guest_id='guest:2'").fetchone()[0]
     finally:
         conn.close()
-    assert promoted is None and "u1" in rej
+    assert prom1 is None                             # back in review
+    assert not _json.loads(rej1 or "[]")             # but NOT marked rejected (statistical)
+    assert prom2 == "u1"                             # the human confirm survives the audit
 
 
 def test_promotion_audit_skips_anchorless_members():
@@ -116,7 +125,7 @@ def test_promotion_audit_skips_anchorless_members():
     _defaults()
     g = _g()
     g.resolve(_vec(7.0))
-    assert g.promote_guest("guest:1", "u9", "Sam")
+    assert g.promote_guest("guest:1", "u9", "Sam", promoted_by="auto")
     report = run_audit(g)
     assert report["promotions_checked"] == 0
     assert report["promotions_detached"] == []

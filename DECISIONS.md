@@ -47,6 +47,33 @@ apart and swapped names. Four decisions, all shipped:
   a healthy pass); promotions re-scored against anchors (detach < 0.30); 24h
   cluster-churn signal.
 
+## Review-loop health fixes (2026-07-08)
+A numeric audit of the review flow found the household's "yes, it's me" answers were
+being fought by the system, not compounded. Five fixes (all `app/gallery.py` +
+`app/face_audit.py`), motivated by measured numbers (184 human promotes vs 118
+auto-detaches on the same cards; 37/52 promotions were junk-embedding clusters; 11%
+of promoted-path IDs were noise faces < 0.20 vs the member's anchors):
+- **Human confirms are sticky.** A `guests.promoted_by` column tags each promotion
+  `human` (review flow) or `auto` (autoheal); NULL legacy rows read as human. The
+  auditor now detaches ONLY `auto` promotions — silently reverting a person's answer
+  and re-queuing the card was a loop they could not win.
+- **A promotion must cohere to speak.** `resolve()` gates the promoted path on an
+  absolute floor (`face_promoted_min_coherence`, 0.30): the LIVE face must resemble
+  the member's anchors, not merely beat the (also-low) other members on margin. This
+  makes a junk/blurry confirm HARMLESS (it routes nothing) so it needn't be detached,
+  and closes the noise-label leak. Promoted-only members (no anchors) are unaffected.
+- **The auditor's detach is not a rejection.** `detach_cluster(reject=False)` for the
+  auditor: a low coherence score is statistical, not a human "not me", so it no
+  longer poisons the cluster's `rejected` set (which had been suppressing the suggest
+  tier and re-queuing cards as unanswerable "who is this?").
+- **A confirm clears a prior rejection.** `promote_guest` removes the member from the
+  cluster's `rejected` set (a one-time boot migration fixed the 24 legacy rows left
+  both promoted-to and rejected-by the same member).
+- **Unanswerable single blips aren't queued.** `review_queue` skips a
+  seen-exactly-once cluster whose only crop has no locatable face — hidden until it
+  recurs (thumb self-heals then). Also: the ledger `reinforced` flag now records an
+  ACTUAL fold, not intent (anchored members never fold).
+
 ## Footage review + record scope (BUILT 2026-07-04)
 The §9.5 review surface is now built end-to-end (was: recorder + index existed, but no
 way to browse/play archived clips and every camera recorded).

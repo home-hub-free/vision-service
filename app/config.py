@@ -347,6 +347,18 @@ class Config:
     face_autoheal_min_sightings: int = field(default_factory=lambda: _i("VISION_FACE_AUTOHEAL_MIN_SIGHTINGS", 5))
     face_autoheal_min_span_s: float = field(default_factory=lambda: _f("VISION_FACE_AUTOHEAL_MIN_SPAN_S", 600.0))
     face_autoheal_min_coherence: float = field(default_factory=lambda: _f("VISION_FACE_AUTOHEAL_MIN_COHERENCE", 0.45))
+    # A PROMOTED cluster only ANSWERS as its member when the LIVE face still coheres
+    # with that member's anchors at least this much. The promotion is a routing hint
+    # ("this cluster is David"), but a promoted cluster's centroid can drift as it
+    # absorbs new sightings, and a junk-embedding cluster the human confirmed from a
+    # blurry card carries no real identity signal — without this floor either one
+    # stamps the member's name on WHOEVER walks past (measured 2026-07-08: 11% of
+    # promoted-path hits were noise faces scoring <0.20 vs the member's anchors). Below
+    # the floor we answer as an anonymous sighting instead. Set at the auditor's
+    # detach bar: a live face too weak to keep the promotion is too weak to speak for
+    # it. Well under face_match_threshold, so the legit far/angled camera (the whole
+    # reason the promoted path exists, ~0.30–0.42 vs anchors) still resolves.
+    face_promoted_min_coherence: float = field(default_factory=lambda: _f("VISION_FACE_PROMOTED_MIN_COHERENCE", 0.30))
 
     # ── gallery audit + smear alarm (app/face_audit.py — the tripwire) ────────
     # Both pollution incidents (2026-07-06 cos 0.459, 2026-07-07 cos 0.702) were

@@ -85,3 +85,23 @@ def test_rebuild_member_discards_polluted_centroid():
     assert prof["has_thumb"]
     assert g.resolve(david).id == "u1"              # David still matches
     assert g.resolve(ana).cls == "guest"            # Ana no longer reads as David
+
+
+def test_reinforced_flag_reflects_actual_fold_not_intent():
+    """The ledger's `reinforced` flag must record an ACTUAL fold, not eligibility. An
+    anchored member never reinforces (anchors are immutable ground truth), so a
+    confident match that CLEARS the reinforce gate must still archive reinforced=False
+    — the flag was previously set from the caller's intent, mislabelling folds that
+    never happened (2026-07-08)."""
+    cfg.captures_enabled = True
+    cfg.face_match_threshold = 0.5
+    cfg.face_match_margin = 0.05
+    cfg.face_reinforce = True
+    cfg.face_reinforce_threshold = 0.5
+    cfg.face_reinforce_margin = 0.05
+    g = _g()
+    g.enroll("u1", "David", _vec(1.0), thumb=JPEG)    # anchored
+    g.resolve(_vec(1.0), thumb=JPEG)                  # confident match, clears reinforce gate
+    match = next(r for r in g.captures() if r["kind"] == "match")
+    assert match["reinforced"] is False               # anchored → no fold → honest flag
+    assert {p["user_id"]: p["samples"] for p in g.profiles()}["u1"] == 1  # untouched

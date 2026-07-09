@@ -324,6 +324,7 @@ def test_legacy_thumb_annotation_caching_rules():
     # "No face found" ([]) is cached — never re-run for that thumb.
     g = _g()
     g.resolve(_vec(4.0), thumb=b"NOFACE")
+    g.resolve(_vec(4.0), thumb=b"NOFACE")   # recurring (≥2) so it stays reviewable
     none_calls = []
     g.thumb_annotator = lambda j, c: none_calls.append(1) or []
     assert g.review_queue()["queue"][0]["face_box"] is None
@@ -349,6 +350,7 @@ def test_bad_thumb_replaced_by_next_face_located_sighting():
     g = _g()
     v = _vec(7.0)
     g.resolve(v, thumb=b"HEADLESS-TORSO")            # legacy crop, box unknown (NULL)
+    g.resolve(v, thumb=b"HEADLESS-TORSO")            # recurring (≥2): kept for review
     # The annotator looks and finds nothing → cached '[]' + surfaced as no_face.
     g.thumb_annotator = lambda j, c: []
     card = g.review_queue()["queue"][0]
@@ -557,3 +559,104 @@ def test_recheck_is_margin_gated_and_side_effect_free():
     # No side effects ever: no guest clusters seeded, no reinforcement folded in.
     assert g.guests() == []
     assert {p["user_id"]: p["samples"] for p in g.profiles()} == before
+
+
+# ── 2026-07-08 review-health fixes ───────────────────────────────────────────
+
+def test_promoted_cluster_below_coherence_floor_answers_anonymous():
+    """A promoted cluster only SPEAKS for its member when the LIVE face still coheres
+    with the member's anchors (face_promoted_min_coherence). A junk-embedding cluster
+    a human confirmed from a blurry card — or one that has drifted — can beat the
+    (also-low) OTHER members on margin alone; without the floor it stamps the member's
+    name on a stranger (the measured 2026-07-08 11%-noise leak). Isolates the floor
+    from the ambiguity gate: the member clearly beats everyone else, but too weakly."""
+    cfg.face_match_threshold = 0.99   # far-camera gate the live face can't clear
+    cfg.face_match_margin = 0.05
+    cfg.guest_cluster_threshold = 0.9
+    cfg.face_promoted_min_coherence = 0.30
+    cfg.face_autoheal_threshold = 2.0
+    g = _g()
+    g.enroll("u1", "David", _vec(1.0))
+    g.enroll("u2", "Ana", _vec(2.0))
+    probe = _mix(1.0, 7.0, 0.2)                       # David-ish but weak (own ~0.2)
+    own = g._member_score_one("u1", probe)
+    other = g._member_score_one("u2", probe)
+    assert own < 0.30 and (own - other) >= cfg.face_match_margin  # floor bites, NOT ambiguity
+    g.resolve(probe)                                  # guest:1
+    assert g.promote_guest("guest:1", "u1", "David")  # a human confirmed a junk card
+    ident = g.resolve(probe)
+    assert ident.cls == "guest" and ident.name is None   # NOT stamped "David"
+
+
+def test_review_queue_hides_unanswerable_single_blip():
+    """A cluster seen exactly once whose only crop has no locatable face is
+    unanswerable and not worth queuing — hidden until it recurs (most of the
+    2026-07-08 churn was such blurry/cut-off 'who is this?' cards)."""
+    cfg.face_match_threshold = 0.99
+    cfg.guest_cluster_threshold = 0.9
+    g = _g()
+    g.thumb_annotator = lambda j, c: []               # detector finds no face in the crop
+    g.resolve(_vec(9.0), thumb=b"BLURRY")             # single sighting, faceless crop
+    assert g.review_queue()["queue"] == []            # hidden — nothing to answer
+    # A second sighting makes it a recurring person → it surfaces (thumb self-heals later).
+    g.resolve(_vec(9.0), thumb=b"BLURRY")
+    q = g.review_queue()["queue"]
+    assert [c["guest_id"] for c in q] == ["guest:1"] and q[0]["no_face"] is True
+
+
+def test_promote_clears_prior_self_rejection():
+    """A "yes, it's me" overrides an earlier "not me" for that member — a cluster must
+    never be left both promoted-to and rejected-by the same member (the 2026-07-08
+    self-contradiction that then suppressed the suggest tier)."""
+    import json
+    cfg.face_match_threshold = 0.99
+    cfg.guest_cluster_threshold = 0.9
+    g = _g()
+    g.enroll("u1", "David", _vec(1.0))
+    g.resolve(_vec(7.0))                               # guest:1
+    assert g.reject_suggestion("guest:1", "u1")        # an earlier "not me"
+    assert g.promote_guest("guest:1", "u1", "David")   # the later "yes it's me"
+    conn = g._db()
+    try:
+        rej = conn.execute(
+            "SELECT rejected_user_ids FROM guests WHERE guest_id='guest:1'").fetchone()[0]
+    finally:
+        conn.close()
+    assert "u1" not in json.loads(rej or "[]")
+
+
+def test_migration_clears_self_rejection_on_existing_rows():
+    """One-time repair of the legacy rows the old loop minted (promoted-to AND
+    rejected-by the same member); runs once on open, kv-guarded, keeps OTHER
+    rejections."""
+    import json
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "gallery.db")
+    cfg.face_match_threshold = 0.99
+    cfg.guest_cluster_threshold = 0.9
+    g = _g_at(path)
+    g.resolve(_vec(7.0))                               # guest:1
+    # Recreate the contradiction the way the old loop did (auditor stamped reject,
+    # human re-promoted without clearing) + un-guard so the migration re-runs.
+    conn = g._db()
+    try:
+        conn.execute(
+            "UPDATE guests SET promoted_user_id='u1', rejected_user_ids=? WHERE guest_id='guest:1'",
+            (json.dumps(["u1", "u2"]),))
+        conn.execute("DELETE FROM settings WHERE key='promoted_self_reject_cleanup'")
+        conn.commit()
+    finally:
+        conn.close()
+    Gallery(path)                                     # re-open → migration runs
+    conn = g._db()
+    try:
+        rej = conn.execute(
+            "SELECT rejected_user_ids FROM guests WHERE guest_id='guest:1'").fetchone()[0]
+    finally:
+        conn.close()
+    rejected = json.loads(rej or "[]")
+    assert "u1" not in rejected and "u2" in rejected  # own member cleared, other kept
+
+
+def _g_at(path):
+    return Gallery(path)
