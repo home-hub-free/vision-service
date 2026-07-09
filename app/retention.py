@@ -115,6 +115,7 @@ class Janitor(threading.Thread):
                     print(f"[vision] janitor pruned {res['removed']} segment(s)", flush=True)
                 sweep_thumbs(cfg.thumb_dir, cfg.retention_days)
                 self._sync_footage()
+                self._pregen_thumbs()
             except Exception as e:  # noqa: BLE001 — the janitor must never crash the box
                 print(f"[vision] janitor error: {e}", flush=True)
 
@@ -129,6 +130,21 @@ class Janitor(threading.Thread):
             st = w.status() if hasattr(w, "status") else {}
             if st.get("records"):
                 sync_camera(self.index, cam_id, st.get("zone") or "_")
+
+    def _pregen_thumbs(self) -> None:
+        """Warm the scrub/filmstrip frame cache for freshly settled segments (a
+        few per tick — new footage arrives at ~1 segment/5min per camera)."""
+        from .state import workers
+        from .thumbs import pregenerate_missing
+
+        cams = []
+        for cam_id, w in list(workers.items()):
+            st = w.status() if hasattr(w, "status") else {}
+            if st.get("records"):
+                cams.append(cam_id)
+        n = pregenerate_missing(self.index, cams)
+        if n:
+            print(f"[vision] pregenerated thumb sets for {n} segment(s)", flush=True)
 
     def stop(self) -> None:
         self._stop.set()

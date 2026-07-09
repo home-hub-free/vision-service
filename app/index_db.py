@@ -229,6 +229,22 @@ class EventIndex:
         finally:
             conn.close()
 
+    def recent_segments(self, cam_id: str, limit: int = 200) -> List[dict]:
+        """Newest-first segment rows for one camera (thumb pregeneration order —
+        the reviewer lands on recent footage first)."""
+        conn = self._db()
+        try:
+            rows = conn.execute(
+                """SELECT id, cam_id, start_ts, end_ts, file FROM segments
+                   WHERE cam_id=? AND file LIKE '%.mp4'
+                   ORDER BY start_ts DESC LIMIT ?""",
+                (cam_id, int(limit)),
+            ).fetchall()
+            return [{"id": r[0], "cam_id": r[1], "start": r[2], "end": r[3], "file": r[4]}
+                    for r in rows]
+        finally:
+            conn.close()
+
     def segment_at(self, cam_id: str, ts: float) -> Optional[dict]:
         conn = self._db()
         try:
