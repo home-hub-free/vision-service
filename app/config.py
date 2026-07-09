@@ -261,6 +261,8 @@ class Config:
     rec_encoder: str = field(default_factory=lambda: os.getenv("VISION_REC_ENCODER", "libx264"))
     rec_dir: str = field(default_factory=lambda: os.getenv("VISION_REC_DIR", os.path.join(DATA, "recordings")))
     hls_dir: str = field(default_factory=lambda: os.getenv("VISION_HLS_DIR", os.path.join(DATA, "hls")))
+    # Playback scrub thumbnails (extracted on demand from segments, disk-cached).
+    thumb_dir: str = field(default_factory=lambda: os.getenv("VISION_THUMB_DIR", os.path.join(DATA, "thumbs")))
     segment_seconds: int = field(default_factory=lambda: _i("VISION_SEGMENT_SECONDS", 300))  # 5-min archive segments
     preroll_seconds: float = field(default_factory=lambda: _f("VISION_PREROLL_SECONDS", 12.0))  # gated ring buffer
     rec_fps: int = field(default_factory=lambda: _i("VISION_REC_FPS", 10))
@@ -363,7 +365,7 @@ class Config:
     face_churn_warn_24h: int = field(default_factory=lambda: _i("VISION_FACE_CHURN_WARN_24H", 30))
 
     def __post_init__(self) -> None:
-        for d in (DATA, self.rec_dir, self.hls_dir):
+        for d in (DATA, self.rec_dir, self.hls_dir, self.thumb_dir):
             os.makedirs(d, exist_ok=True)
 
 

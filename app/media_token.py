@@ -19,8 +19,13 @@ import hmac
 import os
 import time
 
-# TTL is generous enough to start playback + scrub a bit; a fresh URL is one relist away.
-CLIP_TOKEN_TTL_S = 3600
+# Expiry snaps UP to a bucket boundary, so within one wall-clock bucket every mint
+# for a segment yields the SAME token — and therefore the same clip URL. That's what
+# lets the browser HTTP cache actually hit when the reviewer hops between clips,
+# re-lists a day, or comes back later: a per-mint `now + ttl` expiry made every
+# relist a cache-busting new URL, so navigation re-downloaded 40MB files it had
+# already played. Validity ranges 1×–2× the bucket (6–12 h) — still short-lived.
+CLIP_TOKEN_BUCKET_S = 6 * 3600
 
 
 def _secret() -> bytes:
@@ -32,9 +37,9 @@ def _sig(seg_id: int, exp: int) -> str:
     return hmac.new(_secret(), f"{seg_id}.{exp}".encode(), hashlib.sha256).hexdigest()
 
 
-def sign_clip(seg_id: int, ttl_s: int = CLIP_TOKEN_TTL_S) -> str:
-    """Mint a token for a segment, valid for `ttl_s` seconds."""
-    exp = int(time.time()) + int(ttl_s)
+def sign_clip(seg_id: int, bucket_s: int = CLIP_TOKEN_BUCKET_S) -> str:
+    """Mint a token for a segment — stable within the current expiry bucket."""
+    exp = (int(time.time()) // int(bucket_s) + 2) * int(bucket_s)
     return f"{exp}.{_sig(seg_id, exp)}"
 
 

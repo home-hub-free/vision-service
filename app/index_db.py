@@ -99,10 +99,13 @@ class EventIndex:
                 conn.close()
 
     def sync_file_segments(self, cam_id: str, zone: str, rec_dir: str,
-                           entries) -> int:
+                           entries, protect=()) -> int:
         """Reconcile one camera's rows with its on-disk files (footage.py): insert
-        a row per new finished mp4 and purge the legacy recorder-run rows that
-        pointed at the DIRECTORY (unplayable + never-closing — see footage.py).
+        a row per new finished mp4, purge the legacy recorder-run rows that
+        pointed at the DIRECTORY (unplayable + never-closing — see footage.py),
+        and purge rows under THIS rec_dir whose file the scan no longer vouches
+        for (deleted out-of-band, or a stranded moov-less chunk footage.py now
+        excludes) — `protect` shields still-settling files from that purge.
         One transaction under the module lock so concurrent route calls can't
         double-insert a file. Returns how many rows were added."""
         with _lock:
@@ -113,6 +116,14 @@ class EventIndex:
                 # mc200 rows → recordings/mc200-entrance), so purge by shape.
                 conn.execute("DELETE FROM segments WHERE cam_id=? AND file NOT LIKE '%.mp4'",
                              (cam_id,))
+                keep = {p for p, _s, _e in entries} | set(protect)
+                prefix = rec_dir.rstrip(os.sep) + os.sep
+                for (f,) in conn.execute(
+                        "SELECT file FROM segments WHERE cam_id=? AND file LIKE ?",
+                        (cam_id, prefix + "%")).fetchall():
+                    if f not in keep:
+                        conn.execute("DELETE FROM segments WHERE cam_id=? AND file=?",
+                                     (cam_id, f))
                 have = {r[0] for r in conn.execute(
                     "SELECT file FROM segments WHERE cam_id=?", (cam_id,))}
                 added = 0

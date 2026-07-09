@@ -80,6 +80,27 @@ def _rm(path: str, index: Optional[EventIndex]) -> None:
         index.prune_segment(path)
 
 
+def sweep_thumbs(thumb_root: str, retention_days: int) -> int:
+    """Age out the scrub-thumbnail cache with the same horizon as the segments it
+    was extracted from (a thumb can't outlive its clip usefully). Returns removed."""
+    if retention_days <= 0:
+        return 0
+    cutoff = time.time() - retention_days * 86400
+    removed = 0
+    for dirpath, _dirs, files in os.walk(thumb_root):
+        for f in files:
+            if not f.endswith(".jpg"):
+                continue
+            p = os.path.join(dirpath, f)
+            try:
+                if os.stat(p).st_mtime < cutoff:
+                    os.remove(p)
+                    removed += 1
+            except OSError:
+                continue
+    return removed
+
+
 class Janitor(threading.Thread):
     def __init__(self, index: EventIndex) -> None:
         super().__init__(daemon=True, name="vision-janitor")
@@ -92,6 +113,7 @@ class Janitor(threading.Thread):
                 res = sweep(cfg.rec_dir, cfg.retention_days, cfg.disk_cap_gb, self.index)
                 if res["removed"]:
                     print(f"[vision] janitor pruned {res['removed']} segment(s)", flush=True)
+                sweep_thumbs(cfg.thumb_dir, cfg.retention_days)
                 self._sync_footage()
             except Exception as e:  # noqa: BLE001 — the janitor must never crash the box
                 print(f"[vision] janitor error: {e}", flush=True)

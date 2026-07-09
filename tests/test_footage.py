@@ -14,10 +14,15 @@ from app.footage import SETTLE_S, scan_files, sync_camera
 from app.index_db import EventIndex
 
 
-def _mp4(rec_dir: str, name: str, mtime: float) -> str:
+# Structurally valid enough for footage.has_moov: ftyp then a (bodyless) moov.
+_FTYP = b"\x00\x00\x00\x10ftypmp42\x00\x00\x00\x00"
+_MOOV = b"\x00\x00\x00\x08moov"
+
+
+def _mp4(rec_dir: str, name: str, mtime: float, moov: bool = True) -> str:
     path = os.path.join(rec_dir, name)
     with open(path, "wb") as fh:
-        fh.write(b"\x00\x00\x00\x18ftypmp42" + b"v" * 32)
+        fh.write(_FTYP + (_MOOV if moov else b"") + b"v" * 32)
     os.utime(path, (mtime, mtime))
     return path
 
@@ -86,6 +91,41 @@ def test_sync_indexes_files_idempotently_and_purges_legacy_dir_rows(tmp_path):
     past = time.time() - SETTLE_S - 1
     os.utime(grown, (past, past))
     assert sync_camera(idx, "cam1", "sala", rec_root=rec_root) == 1
+
+
+def test_scan_excludes_stranded_moovless_chunks(tmp_path):
+    """A hard death (SIGKILL/crash/power loss) strands the in-progress chunk with
+    no moov — permanently unplayable. It must never reach the timeline (seen
+    live: mc200's July-4 final chunk 502'd thumbs and dead-ended playback)."""
+    rec = str(tmp_path)
+    old = time.time() - 7200
+    good = _mp4(rec, _name(old), old + 300)
+    _mp4(rec, _name(old + 300), old + 360, moov=False)  # stranded
+    assert [e[0] for e in scan_files(rec)] == [good]
+
+
+def test_sync_purges_rows_for_vanished_and_stranded_files(tmp_path):
+    rec_root = str(tmp_path)
+    rec_dir = os.path.join(rec_root, "cam1")
+    os.makedirs(rec_dir)
+    idx = EventIndex(str(tmp_path / "idx.db"))
+    old = time.time() - 7200
+
+    # A stranded chunk that got indexed BEFORE the moov gate existed, and a row
+    # whose file was deleted out-of-band (not via the janitor's prune_segment).
+    stranded = _mp4(rec_dir, _name(old), old + 60, moov=False)
+    stranded_row = idx.open_segment("cam1", "sala", stranded, start_ts=old)
+    idx.close_segment(stranded_row, end_ts=old + 60)
+    gone_row = idx.open_segment("cam1", "sala", os.path.join(rec_dir, _name(old + 600)),
+                                start_ts=old + 600)
+    idx.close_segment(gone_row, end_ts=old + 900)
+    good = _mp4(rec_dir, _name(old + 300), old + 600)
+
+    assert sync_camera(idx, "cam1", "sala", rec_root=rec_root) == 1
+    assert idx.segment_by_id(stranded_row) is None   # unplayable → off the timeline
+    assert idx.segment_by_id(gone_row) is None       # file gone → row gone
+    segs = idx.segments_between("cam1", old - 10, old + 1000)
+    assert [s["file"] for s in segs] == [good]
 
 
 def test_sync_scopes_to_its_camera(tmp_path):

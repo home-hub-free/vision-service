@@ -3,7 +3,7 @@ import os
 import tempfile
 import time
 
-from app.retention import sweep
+from app.retention import sweep, sweep_thumbs
 
 
 def _seg(root: str, name: str, age_days: float, size: int) -> str:
@@ -23,6 +23,16 @@ def test_age_prune_removes_only_old_files():
     res = sweep(root, retention_days=14, disk_cap_gb=0.0)
     assert res["removed"] == 1
     assert not os.path.exists(old) and os.path.exists(fresh)
+
+
+def test_thumb_sweep_ages_out_the_scrub_cache():
+    root = tempfile.mkdtemp()
+    cam = os.path.join(root, "cam1")
+    old = _seg(cam, "12-0.jpg", age_days=40, size=10)
+    fresh = _seg(cam, "13-15.jpg", age_days=1, size=10)
+    other = _seg(cam, "notes.txt", age_days=40, size=10)  # only .jpg is ours to prune
+    assert sweep_thumbs(root, retention_days=14) == 1
+    assert not os.path.exists(old) and os.path.exists(fresh) and os.path.exists(other)
 
 
 def test_disk_cap_prunes_oldest_until_under_cap():
