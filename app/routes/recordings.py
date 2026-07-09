@@ -126,17 +126,24 @@ def clip(cam_id: str, seg_id: int, token: str = Query(...)):
                         headers={"Cache-Control": CLIP_CACHE})
 
 
+THUMB_HEIGHTS = (180, 360)  # bubble-size and full-surface preview-size
+
+
 @router.get("/recordings/{cam_id}/thumb/{seg_id}")
-def thumb(cam_id: str, seg_id: int, token: str = Query(...), t: float = Query(0.0)):
-    """A preview frame `t` seconds into a segment — the timeline's scrub bubble and
-    the player's poster. Same token as the clip (bound to the segment id). Frames
-    snap to a {THUMB_STEP_S}s grid and are extracted once (ffmpeg keyframe seek,
-    ~100ms on a faststart file) into a disk cache the janitor ages out alongside
-    the segments themselves."""
+def thumb(cam_id: str, seg_id: int, token: str = Query(...), t: float = Query(0.0),
+          h: int = Query(180)):
+    """A preview frame `t` seconds into a segment — the timeline's scrub bubble,
+    the player's poster, and the tap-through still overlay. Same token as the
+    clip (bound to the segment id). Frames snap to a {THUMB_STEP_S}s grid and are
+    extracted once (ffmpeg keyframe seek, ~100ms on a faststart file) into a disk
+    cache the janitor ages out alongside the segments themselves. `h` picks the
+    rendition height (whitelisted — it's a cache key, not a free transcoder)."""
     path = _segment_path(cam_id, seg_id, token)
+    if h not in THUMB_HEIGHTS:
+        h = THUMB_HEIGHTS[0]
     at = max(0, int(t // THUMB_STEP_S) * THUMB_STEP_S)
     cache_dir = os.path.join(cfg.thumb_dir, cam_id)
-    cached = os.path.join(cache_dir, f"{seg_id}-{at}.jpg")
+    cached = os.path.join(cache_dir, f"{seg_id}-{at}-{h}.jpg")
     if not os.path.isfile(cached):
         os.makedirs(cache_dir, exist_ok=True)
         tmp = f"{cached}.{os.getpid()}.tmp"
@@ -145,7 +152,7 @@ def thumb(cam_id: str, seg_id: int, token: str = Query(...), t: float = Query(0.
                 res = subprocess.run(
                     ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                      "-ss", str(at), "-i", path, "-frames:v", "1",
-                     "-vf", "scale=-2:180", "-q:v", "7", "-f", "image2", tmp],
+                     "-vf", f"scale=-2:{h}", "-q:v", "7", "-f", "image2", tmp],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
                 # -ss past EOF (open-ended last chunk) produces no frame — retry at 0
                 # so a thumb always exists for a real segment.
@@ -154,7 +161,7 @@ def thumb(cam_id: str, seg_id: int, token: str = Query(...), t: float = Query(0.
                     res = subprocess.run(
                         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                          "-i", path, "-frames:v", "1",
-                         "-vf", "scale=-2:180", "-q:v", "7", "-f", "image2", tmp],
+                         "-vf", f"scale=-2:{h}", "-q:v", "7", "-f", "image2", tmp],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
                 if res.returncode != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) == 0:
                     try:

@@ -190,13 +190,18 @@ def test_thumb_extracts_caches_and_snaps(real_env):
     assert "immutable" in r.headers.get("cache-control", "")
     assert r.content[:2] == b"\xff\xd8"                  # a real JPEG
     # Offsets snap to the 15s grid → one cached frame serves the whole window.
-    cached = os.path.join(real_env["thumb_dir"], "cam1", f"{seg_id}-0.jpg")
+    cached = os.path.join(real_env["thumb_dir"], "cam1", f"{seg_id}-0-180.jpg")
     assert os.path.isfile(cached)
     mtime = os.stat(cached).st_mtime
     r2 = client.get(f"/recordings/cam1/thumb/{seg_id}?token={tok}&t=14")
     assert r2.status_code == 200
     assert os.stat(cached).st_mtime == mtime             # served from cache, not re-run
-    assert os.listdir(os.path.join(real_env["thumb_dir"], "cam1")) == [f"{seg_id}-0.jpg"]
+    assert os.listdir(os.path.join(real_env["thumb_dir"], "cam1")) == [f"{seg_id}-0-180.jpg"]
+    # The bigger rendition is its own cache line; a bogus h falls back to 180.
+    assert client.get(f"/recordings/cam1/thumb/{seg_id}?token={tok}&t=0&h=360").status_code == 200
+    assert os.path.isfile(os.path.join(real_env["thumb_dir"], "cam1", f"{seg_id}-0-360.jpg"))
+    assert client.get(f"/recordings/cam1/thumb/{seg_id}?token={tok}&t=0&h=999").status_code == 200
+    assert not os.path.isfile(os.path.join(real_env["thumb_dir"], "cam1", f"{seg_id}-0-999.jpg"))
 
 
 @needs_ffmpeg
