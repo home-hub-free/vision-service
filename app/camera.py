@@ -30,7 +30,7 @@ import threading
 import time
 from typing import Dict, List, Optional
 
-from . import gpu_yield, hub_push, ingest
+from . import gpu_yield, hub_push, ingest, zone_presence
 from .config import cfg
 from .highres import make_highres_sampler
 from .hub_client import Camera
@@ -69,6 +69,12 @@ class CameraWorker(threading.Thread):
         # thread finishes/joins; shadowing it with an Event breaks join() ("'Event' object
         # is not callable"). Same trap as _ident/_idents above.
         self._stop_evt = threading.Event()
+        # Presence gate (app/zone_presence.py): seed "just saw someone" at boot so a
+        # fresh worker looks for its linger window before it may gate — never blind
+        # a room the service simply hasn't inspected yet.
+        self._last_person_ts = time.time()
+        self._presence_gated = False
+        zone_presence.ensure_started()
 
         # Privacy mode (app/privacy.py): while private the reader never connects, so
         # nothing downstream (stream/record/perception/occupancy) can see the camera.
@@ -278,6 +284,16 @@ class CameraWorker(threading.Thread):
                 continue  # empty scene per the camera's own motion detector — skip inference
             if gpu_yield.active():
                 continue  # a voice turn owns the GPU for a few seconds (app/gpu_yield.py)
+            # Presence gate (app/zone_presence.py): the zone's PIR/mmWave says empty AND this
+            # camera hasn't seen anyone for the linger window → no GPU on an empty room.
+            if not zone_presence.allow(self.cam.zone, self._last_person_ts):
+                if not self._presence_gated:
+                    self._presence_gated = True
+                    print(f"[vision] cam {self.cam.id} presence-gate CLOSED (zone '{self.cam.zone}' empty)", flush=True)
+                continue
+            if self._presence_gated:
+                self._presence_gated = False
+                print(f"[vision] cam {self.cam.id} presence-gate OPEN (zone '{self.cam.zone}')", flush=True)
             try:
                 self._run_pipeline(jpeg, now)
             except Exception as e:  # noqa: BLE001 — a bad frame must never kill perception
@@ -288,6 +304,8 @@ class CameraWorker(threading.Thread):
         if frame is None:
             return  # null build (no cv2): presence-less M0 relay/record only
         tracks = self.detector.detect_and_track(frame)
+        if tracks:
+            self._last_person_ts = now  # presence-gate self-hold: vision sees someone here
         frame_w = int(frame.shape[1])
         # T1 pose pass (§3): only on frames that already have person tracks, same
         # motion gate (we're past it), sub-sampled by pose_every_n (posture changes

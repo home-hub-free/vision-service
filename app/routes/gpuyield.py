@@ -14,7 +14,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
-from .. import gpu_yield
+from .. import gpu_yield, zone_presence
 
 router = APIRouter()
 
@@ -31,3 +31,10 @@ def request_yield(req: YieldRequest | None = None):
 @router.get("/yield")
 def yield_status():
     return gpu_yield.status()
+
+
+@router.get("/presence-gate")
+def presence_gate_status():
+    """Observability for the presence-gated perception (app/zone_presence.py):
+    which zones the hub reports sensors for, their occupancy, and the config."""
+    return zone_presence.status()
