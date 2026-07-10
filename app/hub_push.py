@@ -117,6 +117,14 @@ def room_digest_payload(zone: str, snapshot_people: List[dict],
             person["moving"] = bool(p.get("moving"))
         if p.get("posture"):
             person["posture"] = p["posture"]
+        # SMART_FACE_ID (additive, same pattern): `assumed` = this identity is a
+        # position/sensor hypothesis, not a live face read (the snapshot already capped
+        # its confidence) → the dashboard hedges the name ("David?"); `pending_left` = a
+        # mid-dropout ghost. Forwarded only when set, so older hubs simply don't see them.
+        if p.get("assumed"):
+            person["assumed"] = True
+        if p.get("pending_left"):
+            person["pending_left"] = True
         people.append(person)
     body = {
         "zone": zone,

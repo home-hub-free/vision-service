@@ -83,6 +83,24 @@ def allow(zone: str | None, last_person_ts: float) -> bool:
     return occupied
 
 
+def occupied(zone: str | None) -> bool | None:
+    """The zone's SENSOR-owned occupancy, for the occupancy ledger's sensor-hold
+    (SMART_FACE_ID). Unlike `allow()` (which answers "should I run GPU" and folds in a
+    vision self-hold), this reports ONLY what the hub's mmWave/PIR says — the
+    authoritative "is anyone in this room" signal the ledger uses to decide whether to
+    hold a still person's identity past leave_confirm_s. None when the gate is disabled,
+    the zone has no sensor row, or the poll is stale — i.e. "no corroboration", which
+    keeps the ledger's sensorless 120s-then-left behaviour. Mirrors allow()'s staleness."""
+    if not _ENABLED or not zone:
+        return None
+    with _lock:
+        stale = time.time() - _polled_at > _STALE_S
+        occ = _zones.get(zone.strip().lower())
+    if stale or occ is None:
+        return None
+    return occ
+
+
 def status() -> dict:
     with _lock:
         return {

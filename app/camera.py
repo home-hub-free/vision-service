@@ -37,12 +37,18 @@ from .hub_client import Camera
 from .mjpeg import iter_jpeg_frames, multipart_chunk, open_stream
 from .rtsp import is_rtsp, iter_rtsp_frames, redact_url
 from .occupancy import Identity, Observation, UNKNOWN
-from .perception import (DetectedTrack, assign_faces_to_tracks, classify_posture,
-                         crop_jpeg, decode_jpeg, draw_overlay, face_crop_jpeg,
-                         make_detector, make_face_engine, make_pose_engine,
-                         match_poses_to_tracks)
+from .perception import (DetectedTrack, assign_faces_to_tracks, bbox_iou,
+                         classify_posture, crop_jpeg, decode_jpeg, draw_overlay,
+                         face_crop_jpeg, make_detector, make_face_engine,
+                         make_pose_engine, match_poses_to_tracks)
 from .recorder import Recorder
 from .state import gallery, index, privacy, tracker
+
+# SMART_FACE_ID overlap taint: a tainted track's cached label is force-reverified this
+# often (rate-limit so a persistent overlap doesn't re-embed every single frame) until a
+# decisive clean read clears the taint — ~1/s heals a ByteTrack id-swap far faster than
+# waiting the full face_reverify_s cadence.
+_TAINT_RECHECK_S = 1.0
 
 
 class CameraWorker(threading.Thread):
@@ -117,6 +123,12 @@ class CameraWorker(threading.Thread):
         # per-track last identity-check timestamp (drives the periodic household
         # re-verify that heals tracker id-switches; pruned alongside _idents).
         self._ident_ts: Dict[str, float] = {}
+        # SMART_FACE_ID: track_id -> last-overlap ts. A track whose box overlapped
+        # another person's (past cfg.overlap_taint_iou) is "tainted" — its cached label
+        # is force-reverified and it's barred from ghost adoption in the ledger. Cleared
+        # on a decisive recheck or after cfg.taint_max_s with no further overlap; pruned
+        # alongside _idents.
+        self._taint: Dict[str, float] = {}
         self._last_pipeline = 0.0
         # T0/T1 digest cadence: pose sub-sampling counter (§3 cost-gate lever) and the
         # occupied-zone heartbeat push clock (§2 — activity changes with no salient
@@ -307,6 +319,10 @@ class CameraWorker(threading.Thread):
         if tracks:
             self._last_person_ts = now  # presence-gate self-hold: vision sees someone here
         frame_w = int(frame.shape[1])
+        frame_h = int(frame.shape[0])
+        # SMART_FACE_ID: recompute overlap taint for this pass BEFORE deciding rechecks —
+        # two boxes crossing is the id-swap risk moment (and the "drop assumptions" rule).
+        self._update_taint(tracks, now)
         # T1 pose pass (§3): only on frames that already have person tracks, same
         # motion gate (we're past it), sub-sampled by pose_every_n (posture changes
         # slowly — the cost-gate fallback runs pose every ~3rd detect frame).
@@ -328,10 +344,20 @@ class CameraWorker(threading.Thread):
         need: Dict[str, str] = {}
         for t in tracks:
             ident = self._idents.get(t.track_id)
+            labelled = ident is not None and ident.cls in ("household", "guest")
             if ident is None or ident.cls == "unknown":
                 need[t.track_id] = "resolve"
-            elif (cfg.face_reverify_s > 0 and ident.cls == "household"
+            elif labelled and self._is_tainted(t.track_id, now):
+                # Overlap taint: a possible id-swap — force a re-verify (rate-limited to
+                # ~1/s) until a decisive clean read clears it, instead of waiting the full
+                # face_reverify_s cadence.
+                if now - self._ident_ts.get(t.track_id, 0.0) >= _TAINT_RECHECK_S:
+                    need[t.track_id] = "recheck"
+            elif (cfg.face_reverify_s > 0 and labelled
                   and now - self._ident_ts.get(t.track_id, 0.0) >= cfg.face_reverify_s):
+                # Periodic re-verify — household AND guest: a track mislabelled `guest`
+                # otherwise keeps that label for life (gallery.recheck can upgrade it to
+                # a decisive household match; the ledger's upgrade path merges the entry).
                 need[t.track_id] = "recheck"
         embeds = self._embed_tracks(frame, tracks, need)
         idents: Dict[str, Identity] = {}
@@ -369,12 +395,16 @@ class CameraWorker(threading.Thread):
                         fresh = gallery.recheck(emb)
                     except Exception as e:  # noqa: BLE001 — same posture as resolve
                         print(f"[vision] cam {self.cam.id} recheck error: {e!r}", flush=True)
-                if fresh is not None and fresh.id != ident.id:
-                    print(f"[vision] cam {self.cam.id} track {t.track_id} relabelled "
-                          f"{ident.name or ident.id} -> {fresh.name or fresh.id} "
-                          f"(id-switch heal)", flush=True)
-                    ident = fresh
-                    self._idents[t.track_id] = fresh
+                if fresh is not None:
+                    # A decisive read (match or a confirming same-id) heals any overlap
+                    # taint on this track — the swap suspicion is resolved.
+                    self._clear_taint(t.track_id)
+                    if fresh.id != ident.id:
+                        print(f"[vision] cam {self.cam.id} track {t.track_id} relabelled "
+                              f"{ident.name or ident.id} -> {fresh.name or fresh.id} "
+                              f"(id-switch heal)", flush=True)
+                        ident = fresh
+                        self._idents[t.track_id] = fresh
             idents[t.track_id] = ident
         self._dedupe_household(idents)
         labels: Dict[str, str] = {}
@@ -382,9 +412,10 @@ class CameraWorker(threading.Thread):
         for t in tracks:
             ident = idents[t.track_id]
             observations.append(Observation(track_id=t.track_id, identity=ident,
-                                            bbox=t.bbox, frame_w=frame_w,
+                                            bbox=t.bbox, frame_w=frame_w, frame_h=frame_h,
                                             posture=postures.get(t.track_id),
-                                            context=self.cam.context_capable))
+                                            context=self.cam.context_capable,
+                                            tainted=self._is_tainted(t.track_id, now)))
             # Live overlay label: real name if known, else the default "Person N" for a
             # guest cluster (every detected person is labelled by default), else "person".
             if ident.name:
@@ -394,7 +425,8 @@ class CameraWorker(threading.Thread):
             else:
                 labels[t.track_id] = "person"
 
-        edges = tracker.update(self.cam.id, self.cam.zone, observations, now)
+        edges = tracker.update(self.cam.id, self.cam.zone, observations, now,
+                               zone_occupied=zone_presence.occupied(self.cam.zone))
         zone_people = tracker.snapshot(self.cam.zone, now=now).get(self.cam.zone, [])
         count = len(zone_people)
         self._present = count > 0  # reader reads this to drive gated recording
@@ -549,10 +581,31 @@ class CameraWorker(threading.Thread):
             emb = self.face.embed(frame, bbox)
         return emb, thumb, thumb_box, face_px
 
+    def _update_taint(self, tracks: List, now: float) -> None:
+        """SMART_FACE_ID: taint every pair of tracks whose person boxes overlap past
+        cfg.overlap_taint_iou (the id-swap risk moment / the "2 people cross → drop
+        assumptions" rule), then expire taint older than cfg.taint_max_s. Marking is
+        cheap (pairwise IoU on the handful of boxes we already have)."""
+        for i in range(len(tracks)):
+            for j in range(i + 1, len(tracks)):
+                if bbox_iou(tracks[i].bbox, tracks[j].bbox) >= cfg.overlap_taint_iou:
+                    self._taint[tracks[i].track_id] = now
+                    self._taint[tracks[j].track_id] = now
+        for tid in [k for k, ts in self._taint.items() if now - ts > cfg.taint_max_s]:
+            del self._taint[tid]
+
+    def _is_tainted(self, track_id: str, now: float) -> bool:
+        ts = self._taint.get(track_id)
+        return ts is not None and now - ts <= cfg.taint_max_s
+
+    def _clear_taint(self, track_id: str) -> None:
+        self._taint.pop(track_id, None)
+
     def _prune_idents(self, live: set) -> None:
         if len(self._idents) > 256:
             self._idents = {k: v for k, v in self._idents.items() if k in live}
             self._ident_ts = {k: v for k, v in self._ident_ts.items() if k in live}
+            self._taint = {k: v for k, v in self._taint.items() if k in live}
 
     # ── dashboard re-serve (§3.2 — we are the ONLY client of the cam) ─────────
     def mjpeg_generator(self, annotated: bool = True):

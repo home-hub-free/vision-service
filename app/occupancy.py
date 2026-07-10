@@ -84,12 +84,23 @@ class Observation:
     # older callers/null builds omit them and dwell/speed simply stays unavailable.
     bbox: Optional[Tuple[int, int, int, int]] = None
     frame_w: int = 0
+    # Frame height in pixels (SMART_FACE_ID): with bbox width-normalized by frame_w, the
+    # y axis runs [0, frame_h/frame_w], so the frame-edge (walked-out) test needs the
+    # bottom bound. Optional/default 0 — older callers and null builds omit it and the
+    # exit test simply treats the frame as square (harmless — it only affects which
+    # dropouts are exempt from adoption).
+    frame_h: int = 0
     # T1 (§3): coarse body state from pose, when the pose engine ran on this frame.
     posture: Optional[str] = None  # "standing" | "sitting" | "lying" | "bent"
     # Whether the source camera is context-capable (Camera.context_capable): satellite/
     # ESP32 cams are face-ID-only — too low-quality for full-body inference — so their
     # tracks carry identity but NO T0/T1/T2a context signals downstream.
     context: bool = True
+    # SMART_FACE_ID overlap taint: the camera worker sets this when this track's box
+    # overlaps another person's past cfg.overlap_taint_iou — the id-swap risk moment. A
+    # tainted track can't adopt a named ghost, and an entry supported only by tainted
+    # tracks reads `assumed` until a clean confirm. Default False (older callers/null).
+    tainted: bool = False
 
 
 @dataclass
@@ -109,6 +120,14 @@ class _Track:
     norm_cx: Optional[float] = None
     norm_cy: Optional[float] = None
     pos_ts: float = 0.0
+    # SMART_FACE_ID: the width-normalized bbox (x1,y1,x2,y2 all ÷ frame_w, isotropic —
+    # same space as norm_cx/cy) the ledger remembers as a person's last position for
+    # position-anchored adoption; and the y frame-bound (frame_h/frame_w) for the
+    # frame-edge exit test. Both stay None/0 until a bbox-carrying obs updates motion.
+    norm_bbox: Optional[Tuple[float, float, float, float]] = None
+    norm_ymax: float = 0.0
+    # Mirrors Observation.tainted for the current frame (overlap id-swap suspicion).
+    tainted: bool = False
     # T1: latest posture read (pose frames only — persists between pose cadence ticks),
     # and the once-per-lying-episode latch for the fall-shaped alert.
     posture: Optional[str] = None
@@ -160,6 +179,23 @@ class _Presence:
     last_track_key: str = ""
     last_posture: Optional[str] = None
     last_context: bool = True
+    # ── SMART_FACE_ID: position-anchored identity persistence ──────────────────
+    # The last width-normalized bbox a supporting track was seen at (stamped when the
+    # last support drops), the anchor a re-detected still person is matched against.
+    last_bbox_n: Optional[Tuple[float, float, float, float]] = None
+    # True when the last dropout looked like WALKING OUT of frame (exit signature) —
+    # exempt from adoption + sensor-hold (the person really left). False = stillness.
+    exit_signature: bool = False
+    # `assumed` = presence is a POSITION/SENSOR hypothesis, not a live face read: name
+    # kept, confidence capped + decaying, last_seen frozen at the last VERIFIED sighting
+    # (so person_left stays truthful and a revert is trivial). `assumed_since` anchors
+    # the decay; `assumed_from_pending` remembers the pending_left_since adoption cleared
+    # (restored verbatim on a mismatch revert); `adopt_block_until` bars re-adoption/hold
+    # of this entry after a mismatch disproved it.
+    assumed: bool = False
+    assumed_since: float = 0.0
+    assumed_from_pending: Optional[float] = None
+    adopt_block_until: float = 0.0
 
 
 class OccupancyTracker:
@@ -188,6 +224,13 @@ class OccupancyTracker:
         # re-entry inside rewake_cooldown_s is a continuation (no new wake).
         self._recent_left: Dict[str, Dict[str, float]] = {}
         self._zone_occupied: Dict[str, bool] = {}
+        # SMART_FACE_ID: track-key -> ledger-key an UNRESOLVED track was adopted onto
+        # (named ghost adoption). `_ledger_key` consults it so an adopted track keeps
+        # supporting the named entry instead of re-minting an unknown one.
+        self._adopted: Dict[str, str] = {}
+        # Freshest sensor occupancy per zone (mmWave/PIR, injected by the worker):
+        # zone -> (occupied, ts). Owns whether a dropout ghost is held past leave_confirm_s.
+        self._zone_sensor: Dict[str, Tuple[bool, float]] = {}
 
     # ── ingest ────────────────────────────────────────────────────────────────
     def update(
@@ -196,9 +239,15 @@ class OccupancyTracker:
         zone: str,
         observations: List[Observation],
         now: Optional[float] = None,
+        zone_occupied: Optional[bool] = None,
     ) -> List[Edge]:
         now = time.time() if now is None else now
         zone = zone or "_"
+        # SMART_FACE_ID: remember the freshest sensor occupancy for this zone (kwarg —
+        # the tracker stays pure/no-I/O; the worker reads zone_presence and injects it).
+        # None = no reading this pass (leaves any prior value to age out via staleness).
+        if zone_occupied is not None:
+            self._zone_sensor[zone] = (bool(zone_occupied), now)
         edges: List[Edge] = []
         seen_keys = set()
 
@@ -212,6 +261,7 @@ class OccupancyTracker:
             tr.last_seen = now
             tr.hits += 1
             tr.context = obs.context
+            tr.tainted = obs.tainted
             tr.identity = _better(tr.identity, obs.identity)
             self._update_motion(tr, obs, now)
             if obs.posture is not None:
@@ -229,7 +279,7 @@ class OccupancyTracker:
             elif tr.present:
                 want = self._ledger_key(tr)
                 if tr.announced_identity != want:
-                    continued = self._unregister_for_upgrade(tr)
+                    continued = self._unregister_for_upgrade(tr, now)
                     tr.announced_identity = self._register(tr, edges, now, continued)
                 else:
                     self._refresh(tr, now)
@@ -241,8 +291,13 @@ class OccupancyTracker:
     # ── the presence ledger ───────────────────────────────────────────────────
     def _ledger_key(self, tr: _Track) -> str:
         # Unresolved people can't be matched by identity, so they key per track —
-        # adoption (below) is what heals their flaps.
-        return tr.identity.key() if tr.identity.id else f"unknown:{tr.key}"
+        # adoption (below) is what heals their flaps. A track adopted onto a NAMED ghost
+        # (SMART_FACE_ID) keeps supporting that ghost's key while still unresolved, so
+        # update()'s want-vs-announced check doesn't immediately re-mint it as unknown.
+        if tr.identity.id:
+            return tr.identity.key()
+        adopted = self._adopted.get(tr.key)
+        return adopted if adopted is not None else f"unknown:{tr.key}"
 
     def _register(self, tr: _Track, edges: List[Edge], now: float,
                   continued: Optional[_Presence] = None) -> str:
@@ -263,6 +318,22 @@ class OccupancyTracker:
                 adopted.key = key
                 self._presence[(tr.zone, key)] = adopted
                 entry = adopted
+
+        # Named adoption (SMART_FACE_ID): failing an unknown ghost, a new unresolved
+        # track at the remembered POSITION of a named dropout-signature ghost is
+        # presumed to be that person, re-detected after a stillness dropout. Provisional
+        # (`assumed`), verified for free when a face reads on this same track. Silent —
+        # the entry is already announced, so adoption emits ZERO edges. Kill switch off
+        # (assume_identity=False) → this whole block no-ops (today's behaviour).
+        if entry is None and not tr.identity.id and cfg.assume_identity:
+            ghost = self._adoptable_named_ghost(tr, now)
+            if ghost is not None:
+                self._adopted[tr.key] = ghost.key
+                key = ghost.key
+                ghost.assumed = True
+                ghost.assumed_since = now
+                ghost.assumed_from_pending = ghost.pending_left_since
+                entry = ghost
 
         if entry is not None:
             entry.tracks.add(tr.key)
@@ -291,7 +362,7 @@ class OccupancyTracker:
         self._try_announce(entry, edges, now)
         return key
 
-    def _unregister_for_upgrade(self, tr: _Track) -> Optional[_Presence]:
+    def _unregister_for_upgrade(self, tr: _Track, now: float) -> Optional[_Presence]:
         """A present track re-keyed (unknown→named, guest→member, id-switch heal):
         move its support silently. An emptied entry is a CONTINUATION of the same
         person under the new key, so it dies without a left edge — never a phantom
@@ -301,10 +372,25 @@ class OccupancyTracker:
         if old is None:
             return None
         old.tracks.discard(tr.key)
-        if not old.tracks:
-            del self._presence[(old.zone, old.key)]
-            return old
-        return None
+        self._adopted.pop(tr.key, None)
+        if old.tracks:
+            return None
+        # SMART_FACE_ID mismatch: an emptied ASSUMED entry vacated by a track that
+        # resolved to a DIFFERENT identity is NOT a continuation — the face just proved
+        # the position-adoption wrong. Revert it to exactly the pending-left state
+        # adoption cleared (last_seen is still the last VERIFIED sighting, so the
+        # eventual person_left is truthful), bar re-adoption/re-hold briefly, and inherit
+        # NOTHING (the resolved person is genuinely new → gets their own entered).
+        if old.assumed and old.key != self._ledger_key(tr):
+            old.assumed = False
+            old.assumed_since = 0.0
+            old.pending_left_since = (old.assumed_from_pending
+                                      if old.assumed_from_pending is not None else old.last_seen)
+            old.assumed_from_pending = None
+            old.adopt_block_until = now + cfg.adopt_block_s
+            return None  # entry stays in _presence as a pending-left ghost, NOT inherited
+        del self._presence[(old.zone, old.key)]
+        return old
 
     def _refresh(self, tr: _Track, now: float) -> None:
         entry = self._presence.get((tr.zone, tr.announced_identity or ""))
@@ -314,7 +400,18 @@ class OccupancyTracker:
             self._touch(entry, tr, now)
 
     def _touch(self, entry: _Presence, tr: _Track, now: float) -> None:
-        entry.last_seen = now
+        # SMART_FACE_ID: a face that reads the SAME person on a supporting track VERIFIES
+        # an assumed entry — clear the assumption (full confidence, live sighting again).
+        if entry.assumed and tr.identity.id and entry.identity.id \
+                and tr.identity.id == entry.identity.id:
+            entry.assumed = False
+            entry.assumed_since = 0.0
+            entry.assumed_from_pending = None
+        # While still assumed, DON'T advance last_seen — keep it at the last VERIFIED
+        # sighting so person_left stays truthful and a mismatch revert is trivial. The
+        # supporting (adopted, unresolved) track is a hypothesis, not a confirmation.
+        if not entry.assumed:
+            entry.last_seen = now
         entry.identity = _better(entry.identity, tr.identity)
         entry.last_cam = tr.cam_id
         entry.last_track_key = tr.key
@@ -336,6 +433,70 @@ class OccupancyTracker:
                       if e.zone == zone and e.pending_left_since is not None
                       and not e.identity.id]
         return min(candidates, key=lambda e: e.pending_left_since) if candidates else None
+
+    def _adoptable_named_ghost(self, tr: _Track, now: float) -> Optional[_Presence]:
+        """The ONE named, dropout-signature ghost on this camera whose remembered
+        position `tr` re-detects — or None. Ambiguity is fatal by design: two candidate
+        ghosts in range, a tainted new track, OR a second unresolved track also at that
+        spot → adopt nobody (guessing between people is exactly the false-ID we avoid).
+        A track with no position (null build / face-only cam) can't be anchored either."""
+        if tr.tainted or tr.norm_bbox is None:
+            return None
+        candidates = [
+            e for e in self._presence.values()
+            if e.zone == tr.zone and e.pending_left_since is not None
+            and e.identity.id and not e.exit_signature and not e.assumed
+            and e.last_cam == tr.cam_id and now >= e.adopt_block_until
+            and e.last_bbox_n is not None
+            and self._position_match(e.last_bbox_n, tr.norm_bbox)
+        ]
+        if len(candidates) != 1:
+            return None
+        ghost = candidates[0]
+        # Two claimants: another unresolved live track also sits at this ghost's spot →
+        # we can't tell which one is the returning person, so adopt neither.
+        for other in self._tracks.values():
+            if other.key == tr.key or other.zone != tr.zone or other.cam_id != tr.cam_id:
+                continue
+            if other.identity.id or other.norm_bbox is None:
+                continue
+            if self._position_match(ghost.last_bbox_n, other.norm_bbox):
+                return None
+        return ghost
+
+    def _position_match(self, a: Tuple[float, float, float, float],
+                        b: Tuple[float, float, float, float]) -> bool:
+        """Width-normalized bbox `a` (a ghost's last spot) vs `b` (a live track): a match
+        is IoU ≥ assume_min_iou OR center distance ≤ assume_radius_fw. Either suffices —
+        a re-detected still person's box drifts a little between the drop and re-detect."""
+        if _bbox_iou(a, b) >= cfg.assume_min_iou:
+            return True
+        acx, acy = (a[0] + a[2]) / 2.0, (a[1] + a[3]) / 2.0
+        bcx, bcy = (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
+        return math.hypot(acx - bcx, acy - bcy) <= cfg.assume_radius_fw
+
+    def _exit_signature(self, tr: _Track) -> bool:
+        """Did this track WALK OUT of frame (vs drop out to stillness)? Exit = last
+        speed ≥ the passing bar AND its last center within edge_exit_margin_fw of a frame
+        boundary. Exits are exempt from adoption + sensor-hold (the person really left);
+        everything else is a stillness dropout, the case this feature persists across."""
+        if tr.speed < cfg.activity_speed_fws or tr.norm_cx is None or tr.norm_cy is None:
+            return False
+        ymax = tr.norm_ymax if tr.norm_ymax > 0 else 1.0
+        dist = min(tr.norm_cx, 1.0 - tr.norm_cx, tr.norm_cy, ymax - tr.norm_cy)
+        return dist <= cfg.edge_exit_margin_fw
+
+    def _zone_sensor_state(self, zone: str, now: float) -> Optional[bool]:
+        """The freshest injected sensor occupancy for a zone, or None when there is no
+        reading or it has gone stale (older than zone_sensor_stale_s) — None means "no
+        corroboration", which keeps the sensorless 120s leave behaviour."""
+        v = self._zone_sensor.get(zone)
+        if v is None:
+            return None
+        occupied, ts = v
+        if now - ts > cfg.zone_sensor_stale_s:
+            return None
+        return occupied
 
     def _confirm_elsewhere(self, key: str, except_zone: str, now: float) -> List[Edge]:
         edges: List[Edge] = []
@@ -359,10 +520,21 @@ class OccupancyTracker:
                 if not entry.tracks:
                     if entry.announced:
                         entry.pending_left_since = now
-                        entry.last_seen = tr.last_seen  # when they actually vanished
+                        # SMART_FACE_ID: remember WHERE this last support was and whether
+                        # it walked out (exit) or dropped to stillness — the anchor + gate
+                        # for position-adoption and the sensor-hold. last_seen stays at the
+                        # last VERIFIED sighting for an assumed entry (the dropping track
+                        # was itself only a hypothesis) — never advance it to an unverified
+                        # track's last frame.
+                        if not entry.assumed:
+                            entry.last_seen = tr.last_seen  # when they actually vanished
+                        if tr.norm_bbox is not None:
+                            entry.last_bbox_n = tr.norm_bbox
+                        entry.exit_signature = self._exit_signature(tr)
                     else:
                         # A blip that died before it settled — total silence.
                         del self._presence[(entry.zone, entry.key)]
+            self._adopted.pop(tr.key, None)
             del self._tracks[key]
 
     def _sweep(self, now: float) -> List[Edge]:
@@ -373,9 +545,24 @@ class OccupancyTracker:
         for entry in list(self._presence.values()):
             if not entry.announced and entry.tracks:
                 self._try_announce(entry, edges, now)
-            if entry.pending_left_since is not None and \
-                    now - entry.pending_left_since >= cfg.leave_confirm_s:
-                edges.extend(self._confirm_left(entry, now))
+            if entry.pending_left_since is None or \
+                    now - entry.pending_left_since < cfg.leave_confirm_s:
+                continue
+            # Past the leave-confirm window. SMART_FACE_ID sensor-corroborated hold: a
+            # NAMED, dropout-signature ghost is HELD as an assumed-present entry (no left
+            # edge) while the zone's mmWave/PIR still reads occupied — vision lost the
+            # track to stillness but the sensor says someone is here. Anything else (an
+            # unknown, an exit-signature walk-out, a just-reverted entry inside its block,
+            # or a zone whose sensor reads empty / stale / None) confirms left promptly,
+            # exactly as before. Zones with no sensor (None) keep the 120s behaviour.
+            if (cfg.assume_identity and entry.identity.id and not entry.exit_signature
+                    and now >= entry.adopt_block_until
+                    and self._zone_sensor_state(entry.zone, now) is True):
+                if not entry.assumed:
+                    entry.assumed = True
+                    entry.assumed_since = now
+                continue
+            edges.extend(self._confirm_left(entry, now))
         self._recompute_zones(edges, now)
         return edges
 
@@ -409,6 +596,12 @@ class OccupancyTracker:
             inst = math.hypot(cx - tr.norm_cx, cy - tr.norm_cy) / (now - tr.pos_ts)
             tr.speed = SPEED_EMA_ALPHA * inst + (1.0 - SPEED_EMA_ALPHA) * tr.speed
         tr.norm_cx, tr.norm_cy, tr.pos_ts = cx, cy, now
+        # SMART_FACE_ID: the width-normalized bbox (isotropic — same units as the center)
+        # the ledger anchors adoption to, plus the y frame-bound for the frame-edge exit
+        # test. frame_h absent (older callers) → treat the frame as square (norm_ymax 1.0).
+        tr.norm_bbox = (x1 / obs.frame_w, y1 / obs.frame_w, x2 / obs.frame_w, y2 / obs.frame_w)
+        if obs.frame_h > 0:
+            tr.norm_ymax = obs.frame_h / obs.frame_w
 
     def _update_posture(self, tr: _Track, posture: str, now: float) -> None:
         """T1 debounce: a NEW posture must be read consistently for posture_stable_s
@@ -475,6 +668,7 @@ class OccupancyTracker:
             if tr.cam_id != cam_id:
                 continue
             dead.add(key)
+            self._adopted.pop(key, None)  # SMART_FACE_ID: drop this cam's adoption links
             del self._tracks[key]
         for pkey, entry in list(self._presence.items()):
             supported_here = bool(entry.tracks & dead)
@@ -502,6 +696,15 @@ class OccupancyTracker:
                 "since": entry.first_seen,
                 **entry.identity.as_meta(),
             }
+            # SMART_FACE_ID (additive — as_meta() is untouched, it rides MQTT edges): mark
+            # a position/sensor-assumed identity so the dashboard hedges the name ("David?")
+            # and cap/decay its confidence (a hypothesis, not a read). Mark a mid-dropout
+            # ghost pending_left so consumers can treat it as fading rather than solid.
+            if entry.assumed:
+                item["assumed"] = True
+                item["confidence"] = self._assumed_conf(entry, now)
+            if entry.pending_left_since is not None:
+                item["pending_left"] = True
             context = tr.context if tr else entry.last_context
             if context:
                 # T0 activity signals (§2): how long they've been here + whether they're
@@ -520,6 +723,17 @@ class OccupancyTracker:
         live = [self._tracks[k] for k in entry.tracks if k in self._tracks]
         return max(live, key=lambda t: t.last_seen) if live else None
 
+    def _assumed_conf(self, entry: _Presence, now: float) -> float:
+        """Confidence for an assumed entry: capped at assume_conf_cap when adopted/held,
+        then decayed linearly to assume_conf_floor over assume_max_s of coasting without
+        a face read. Never returns above the identity's own confidence, never below floor."""
+        base = min(entry.identity.confidence, cfg.assume_conf_cap)
+        floor = cfg.assume_conf_floor
+        if base <= floor or cfg.assume_max_s <= 0:
+            return round(base, 3)
+        frac = min(1.0, max(0.0, now - entry.assumed_since) / cfg.assume_max_s)
+        return round(base - (base - floor) * frac, 3)
+
     def who_is_here(self, zone: Optional[str] = None) -> List[dict]:
         snap = self.snapshot(zone)
         people: List[dict] = []
@@ -527,6 +741,22 @@ class OccupancyTracker:
             for p in occ:
                 people.append({"zone": z, **p})
         return people
+
+
+def _bbox_iou(a: Tuple[float, float, float, float],
+              b: Tuple[float, float, float, float]) -> float:
+    """IoU of two boxes (SMART_FACE_ID position gate). Kept local to the pure ledger —
+    the same formula as perception.bbox_iou, but occupancy stays free of the perception
+    module so it remains model-free and unit-testable without pixels."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    return inter / (area_a + area_b - inter or 1.0)
 
 
 def _better(current: Identity, incoming: Identity) -> Identity:

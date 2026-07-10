@@ -254,6 +254,51 @@ class Config:
     leave_confirm_s: float = field(default_factory=lambda: _f("VISION_LEAVE_CONFIRM_S", 120.0))
     identify_settle_s: float = field(default_factory=lambda: _f("VISION_IDENTIFY_SETTLE_S", 8.0))
 
+    # ── position-anchored identity persistence (SMART_FACE_ID — the stillness fix) ─
+    # YOLO drops a seated/still person (measured 30–170s), and the re-detection comes
+    # back a fresh unknown → the ledger overcounts ("David + 1 guest + 1 more" when
+    # David is alone). Physics we exploit: a body lost to STILLNESS has not moved, so
+    # the next detection at the SAME spot is the same person. A named ghost that went
+    # pending-left with a *dropout* signature (still + mid-frame, NOT walking out at a
+    # frame edge) is adopted by a new unresolved track on the same camera whose bbox
+    # overlaps its remembered position — provisionally (`assumed`, confidence capped),
+    # verified for free when a face reads again on that track. Overlap voids assumptions
+    # (the false-ID case); the mmWave/PIR sensor — not vision — owns whether the room is
+    # still occupied. `assume_identity` is the kill switch (gates BOTH adoption and the
+    # sensor-hold); off = today's 120s-ghost-then-left behaviour, verbatim.
+    assume_identity: bool = field(default_factory=lambda: _b("VISION_ASSUME_IDENTITY", True))
+    # Position gate for adoption: the new track's bbox must overlap the ghost's last
+    # remembered bbox at IoU ≥ assume_min_iou, OR its center must sit within
+    # assume_radius_fw (width-normalized, isotropic units — same space as norm_cx/cy) of
+    # the ghost's. Either is enough (a re-detected still person's box wanders a little).
+    assume_min_iou: float = field(default_factory=lambda: _f("VISION_ASSUME_MIN_IOU", 0.3))
+    assume_radius_fw: float = field(default_factory=lambda: _f("VISION_ASSUME_RADIUS_FW", 0.15))
+    # Exit signature: a track whose last speed ≥ activity_speed_fws AND whose center is
+    # within this margin of a frame boundary *walked out* — its ghost is NOT adopted or
+    # sensor-held (the person really left). Everything else is a stillness dropout.
+    edge_exit_margin_fw: float = field(default_factory=lambda: _f("VISION_EDGE_EXIT_MARGIN_FW", 0.06))
+    # Assumed identity is a hypothesis, not a read: confidence is capped at assume_conf_cap
+    # the moment we adopt/hold, then decays linearly to assume_conf_floor by assume_max_s
+    # of coasting on position without a face — the longer we go unverified, the less sure.
+    assume_conf_cap: float = field(default_factory=lambda: _f("VISION_ASSUME_CONF_CAP", 0.5))
+    assume_conf_floor: float = field(default_factory=lambda: _f("VISION_ASSUME_CONF_FLOOR", 0.2))
+    assume_max_s: float = field(default_factory=lambda: _f("VISION_ASSUME_MAX_S", 3600.0))
+    # After a mismatch (an adopted track's face resolves to someone ELSE), the wrongly
+    # assumed entry reverts to pending-left and is barred from re-adoption/re-hold for
+    # this long — so it can't immediately re-grab the very track that disproved it.
+    adopt_block_s: float = field(default_factory=lambda: _f("VISION_ADOPT_BLOCK_S", 60.0))
+    # Overlap taint (the "2 people cross → drop assumptions" rule): two person boxes
+    # overlapping past overlap_taint_iou taint BOTH tracks — force-reverify their cached
+    # labels (heals a ByteTrack id-swap in ~1s instead of waiting face_reverify_s) and
+    # bar them from ghost adoption. Taint clears on a decisive recheck or after
+    # taint_max_s with no further overlap.
+    overlap_taint_iou: float = field(default_factory=lambda: _f("VISION_OVERLAP_TAINT_IOU", 0.35))
+    taint_max_s: float = field(default_factory=lambda: _f("VISION_TAINT_MAX_S", 300.0))
+    # The ledger's sensor-hold trusts a zone_occupied reading only this fresh; older →
+    # treated as None (no corroboration → the sensorless 120s behaviour). The worker
+    # injects zone_presence.occupied(zone), which is itself already staleness-gated.
+    zone_sensor_stale_s: float = field(default_factory=lambda: _f("VISION_ZONE_SENSOR_STALE_S", 30.0))
+
     # ── recording (§9) ───────────────────────────────────────────────────────
     # mode: "off" | "continuous" | "gated" | "hybrid" (§9.2; hybrid is the rec default).
     # encoder: "libx264" (CPU, today's recipe) | "vaapi"/"amf" (GPU — DECISION §9.1/§11.4).

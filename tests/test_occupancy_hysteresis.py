@@ -14,19 +14,51 @@ from app.occupancy import (EDGE_ENTERED, EDGE_GUEST_ARRIVED, EDGE_IDENTIFIED,
                            OccupancyTracker)
 
 
+_ASSUME_KNOBS = ("assume_identity", "assume_min_iou", "assume_radius_fw",
+                 "edge_exit_margin_fw", "assume_conf_cap", "assume_conf_floor",
+                 "assume_max_s", "adopt_block_s", "zone_sensor_stale_s",
+                 "activity_speed_fws")
+
+
 @pytest.fixture(autouse=True)
 def knobs():
     old = (cfg.enter_frames, cfg.leave_grace_s, cfg.rewake_cooldown_s,
            cfg.leave_confirm_s, cfg.identify_settle_s)
+    old_assume = {k: getattr(cfg, k) for k in _ASSUME_KNOBS}
     cfg.enter_frames, cfg.leave_grace_s, cfg.rewake_cooldown_s = 1, 5.0, 30.0
     cfg.leave_confirm_s, cfg.identify_settle_s = 120.0, 8.0
+    # SMART_FACE_ID knobs pinned to their design defaults so these cases are deterministic
+    # regardless of the env the suite runs under.
+    cfg.assume_identity = True
+    cfg.assume_min_iou, cfg.assume_radius_fw, cfg.edge_exit_margin_fw = 0.3, 0.15, 0.06
+    cfg.assume_conf_cap, cfg.assume_conf_floor, cfg.assume_max_s = 0.5, 0.2, 3600.0
+    cfg.adopt_block_s, cfg.zone_sensor_stale_s = 60.0, 30.0
+    cfg.activity_speed_fws = 0.25
     yield
     (cfg.enter_frames, cfg.leave_grace_s, cfg.rewake_cooldown_s,
      cfg.leave_confirm_s, cfg.identify_settle_s) = old
+    for k, v in old_assume.items():
+        setattr(cfg, k, v)
 
 
 def _david():
     return Identity(id="u1", name="David", cls="household", confidence=0.9)
+
+
+def _ana():
+    return Identity(id="u2", name="Ana", cls="household", confidence=0.85)
+
+
+def _obs(track_id, ident=None, *, cx=0.5, cy=0.5, w=0.2, h=0.4,
+         tainted=False, fw=1000, fh=1000):
+    """Observation with a bbox centered at (cx, cy) in WIDTH-normalized units (both axes
+    ÷ frame_w, matching occupancy's isotropic space) — so position-anchored adoption /
+    the frame-edge exit test have real geometry to work with. A square frame (fh==fw)
+    puts the y frame-bound at 1.0, so cy is the fraction from top."""
+    x1, x2 = int((cx - w / 2) * fw), int((cx + w / 2) * fw)
+    y1, y2 = int((cy - h / 2) * fw), int((cy + h / 2) * fw)
+    kw = dict(bbox=(x1, y1, x2, y2), frame_w=fw, frame_h=fh, tainted=tainted)
+    return Observation(track_id, ident, **kw) if ident else Observation(track_id, **kw)
 
 
 def _edges(t, *args, **kw):
@@ -157,3 +189,168 @@ def test_privacy_drop_camera_stays_silent_but_keeps_other_camera_support():
     assert t.snapshot("sala") == {}                              # gone, silently
     assert _edges(t, "camC", "cocina", [], now=500.0) == [], \
         "no deferred left/room_empty ever surfaces for privacy-dropped presence"
+
+
+# ── SMART_FACE_ID: position-anchored identity persistence ─────────────────────
+# A still person whose YOLO track drops out keeps their identity provisionally
+# (assumed), verified when a face reads again; overlapping/mismatched reads void the
+# assumption; the mmWave sensor — not vision — decides whether the room is still occupied.
+
+
+def test_stillness_dropout_adopts_named_ghost_then_face_confirms():
+    """David sits, his track drops to stillness, a NEW unresolved track re-detects at
+    the SAME spot → adopted as (assumed) David: ONE entry, ZERO edges, hedged confidence.
+    A face reading David again on that track clears the assumption at full confidence."""
+    t = OccupancyTracker()
+    assert _edges(t, "cam", "sala", [_obs("1", _david())], now=0.0) == \
+        [EDGE_ENTERED, EDGE_IDENTIFIED]
+    assert _edges(t, "cam", "sala", [], now=10.0) == []           # dropout: pending-left
+    # New unresolved track at the same position, 40s later → adopted SILENTLY.
+    assert _edges(t, "cam", "sala", [_obs("2", cx=0.51)], now=40.0) == []
+    snap = t.snapshot("sala", now=41.0)["sala"]
+    assert len(snap) == 1                                          # NOT David + a stranger
+    assert snap[0]["name"] == "David" and snap[0]["assumed"] is True
+    assert snap[0]["confidence"] <= cfg.assume_conf_cap           # capped hypothesis
+    assert snap[0]["since"] == 0.0                                # dwell continuous
+    # A face reads David on that same track → assumption cleared, full confidence back.
+    assert _edges(t, "cam", "sala", [_obs("2", _david(), cx=0.51)], now=42.0) == []
+    snap = t.snapshot("sala", now=42.0)["sala"]
+    assert snap[0].get("assumed") is None
+    assert snap[0]["confidence"] == pytest.approx(0.9)
+
+
+def test_adoption_mismatch_reverts_ghost_and_announces_the_real_person():
+    """The adopted track's face resolves to ANA, not David: David's entry reverts to a
+    pending-left ghost (assumption dropped, last VERIFIED sighting intact), Ana announces
+    as a genuinely new person (no inherited announcement), and David's eventual
+    person_left fires ONCE with the truthful timestamp — never a solid double-count."""
+    t = OccupancyTracker()
+    t.update("cam", "sala", [_obs("1", _david())], now=0.0)
+    t.update("cam", "sala", [_obs("1", _david())], now=30.0)
+    assert _edges(t, "cam", "sala", [], now=40.0) == []           # David pending-left
+    assert _edges(t, "cam", "sala", [_obs("2", cx=0.5)], now=45.0) == []   # adopted
+    assert t.snapshot("sala", now=45.0)["sala"][0]["assumed"] is True
+    # The face on that track is ANA — the position adoption was wrong.
+    e = t.update("cam", "sala", [_obs("2", _ana(), cx=0.5)], now=50.0)
+    kinds = [x.edge for x in e]
+    assert EDGE_ENTERED in kinds and EDGE_IDENTIFIED in kinds     # Ana is a NEW person
+    by_name = {p.get("name"): p for p in t.snapshot("sala", now=50.0)["sala"]}
+    assert by_name["Ana"].get("assumed") is None and by_name["Ana"].get("pending_left") is None
+    # David is a FADING ghost (pending-left), not a solid second present person.
+    assert by_name["David"]["pending_left"] is True and by_name["David"].get("assumed") is None
+    solid = [p for p in t.snapshot("sala", now=50.0)["sala"] if not p.get("pending_left")]
+    assert len(solid) == 1 and solid[0]["name"] == "Ana"
+    # David's person_left confirms once, stamped at his last VERIFIED sighting (30.0).
+    e = t.update("cam", "sala", [_obs("2", _ana(), cx=0.5)], now=50.0 + cfg.leave_confirm_s + 1)
+    lefts = [x for x in e if x.edge == EDGE_LEFT]
+    assert len(lefts) == 1 and lefts[0].identity.id == "u1" and lefts[0].ts == 30.0
+    remaining = t.snapshot("sala", now=50.0 + cfg.leave_confirm_s + 1)["sala"]
+    assert len(remaining) == 1 and remaining[0]["name"] == "Ana"
+
+
+def test_exit_signature_ghost_is_never_adopted_or_sensor_held():
+    """David WALKS OUT (fast, center at a frame edge) then drops. His ghost carries an
+    exit signature → a new track at that spot must NOT adopt him, and even an occupied
+    sensor must NOT hold him — 'Ana leaves, David stays' can't resurrect a walk-out."""
+    t = OccupancyTracker()
+    t.update("cam", "sala", [_obs("1", _david(), cx=0.5)], now=0.0)
+    # Fast move to the right edge (speed above the bar, center within the exit margin).
+    t.update("cam", "sala", [_obs("1", _david(), cx=0.97)], now=0.5)
+    assert _edges(t, "cam", "sala", [], now=10.0) == []           # exit-signature pending-left
+    assert _edges(t, "cam", "sala", [_obs("2", cx=0.95)], now=20.0) == []  # new unknown, NO adopt
+    snap = t.snapshot("sala", now=20.0)["sala"]
+    assert not any(p.get("assumed") for p in snap)                # nobody assumed
+    # Sensor reads occupied, yet an EXIT ghost still confirms left at leave_confirm_s.
+    e = t.update("cam", "sala", [_obs("2", cx=0.95)],
+                 now=10.0 + cfg.leave_confirm_s + 1, zone_occupied=True)
+    assert any(x.edge == EDGE_LEFT and x.identity.id == "u1" for x in e)
+
+
+def test_two_candidate_ghosts_block_adoption():
+    """Two named people drop to stillness; a new track between them is in range of BOTH
+    → ambiguous, so it adopts neither (guessing between people is the false-ID we avoid)."""
+    t = OccupancyTracker()
+    t.update("cam", "sala", [_obs("1", _david(), cx=0.4), _obs("2", _ana(), cx=0.6)], now=0.0)
+    assert _edges(t, "cam", "sala", [], now=10.0) == []           # both pending-left dropouts
+    assert _edges(t, "cam", "sala", [_obs("3", cx=0.5)], now=20.0) == []
+    snap = t.snapshot("sala", now=20.0)["sala"]
+    assert not any(p.get("assumed") for p in snap)
+
+
+def test_tainted_track_cannot_adopt():
+    """An overlap-tainted new track is barred from ghost adoption even at a perfect
+    position match — the id-swap risk case must not crystallize a wrong identity."""
+    t = OccupancyTracker()
+    t.update("cam", "sala", [_obs("1", _david(), cx=0.5)], now=0.0)
+    assert _edges(t, "cam", "sala", [], now=10.0) == []
+    assert _edges(t, "cam", "sala", [_obs("2", cx=0.5, tainted=True)], now=20.0) == []
+    assert not any(p.get("assumed") for p in t.snapshot("sala", now=20.0)["sala"])
+
+
+def test_sensor_occupied_holds_named_dropout_past_leave_confirm():
+    """The mmWave/PIR says the room is still occupied → a named dropout ghost is HELD as
+    an assumed-present entry past leave_confirm_s, no person_left, zero edges."""
+    t = OccupancyTracker()
+    t.update("cam", "sala", [_obs("1", _david())], now=0.0)
+    t.update("cam", "sala", [_obs("1", _david())], now=30.0)
+    assert _edges(t, "cam", "sala", [], now=40.0, zone_occupied=True) == []
+    e = t.update("cam", "sala", [], now=40.0 + cfg.leave_confirm_s + 5, zone_occupied=True)
+    assert [x.edge for x in e] == []                              # held, never left
+    snap = t.snapshot("sala", now=40.0 + cfg.leave_confirm_s + 5)["sala"]
+    assert len(snap) == 1 and snap[0]["name"] == "David"
+    assert snap[0]["assumed"] is True and snap[0]["pending_left"] is True
+
+
+def test_sensor_hold_releases_left_when_zone_goes_empty():
+    """A sensor-held ghost confirms left PROMPTLY (truthful ts) once the sensor flips
+    to empty — the hold was contingent on live corroboration."""
+    t = OccupancyTracker()
+    t.update("cam", "sala", [_obs("1", _david())], now=0.0)
+    t.update("cam", "sala", [_obs("1", _david())], now=30.0)
+    t.update("cam", "sala", [], now=40.0, zone_occupied=True)
+    assert _edges(t, "cam", "sala", [], now=200.0, zone_occupied=True) == []   # held
+    assert t.snapshot("sala", now=200.0)["sala"][0]["assumed"] is True
+    e = t.update("cam", "sala", [], now=205.0, zone_occupied=False)
+    lefts = [x for x in e if x.edge == EDGE_LEFT]
+    assert len(lefts) == 1 and lefts[0].ts == 30.0
+    assert t.snapshot("sala") == {}
+
+
+def test_no_sensor_data_keeps_todays_120s_behavior():
+    """A zone the hub has no sensor for (zone_occupied always None) keeps the classic
+    leave_confirm_s behaviour exactly — no hold, confirm at 120s."""
+    t = OccupancyTracker()
+    t.update("cam", "sala", [_obs("1", _david())], now=0.0)
+    t.update("cam", "sala", [_obs("1", _david())], now=30.0)
+    t.update("cam", "sala", [], now=40.0)                         # no zone_occupied, ever
+    assert _edges(t, "cam", "sala", [], now=40.0 + cfg.leave_confirm_s - 1) == []
+    e = t.update("cam", "sala", [], now=40.0 + cfg.leave_confirm_s + 1)
+    lefts = [x for x in e if x.edge == EDGE_LEFT]
+    assert len(lefts) == 1 and lefts[0].ts == 30.0
+
+
+def test_stale_sensor_reading_falls_back_to_120s_leave():
+    """A sensor reading that has gone stale (older than zone_sensor_stale_s) is treated
+    as no corroboration → the ghost confirms left at leave_confirm_s, not held forever."""
+    t = OccupancyTracker()
+    t.update("cam", "sala", [_obs("1", _david())], now=0.0)
+    t.update("cam", "sala", [_obs("1", _david())], now=30.0)
+    t.update("cam", "sala", [], now=40.0, zone_occupied=True)     # last reading at 40.0
+    # By 40+121 the reading is ~121s old (>> zone_sensor_stale_s) → confirm left.
+    e = t.update("cam", "sala", [], now=40.0 + cfg.leave_confirm_s + 1)
+    lefts = [x for x in e if x.edge == EDGE_LEFT]
+    assert len(lefts) == 1 and lefts[0].ts == 30.0
+
+
+def test_kill_switch_off_disables_adoption_and_sensor_hold():
+    """assume_identity=False → the whole feature no-ops: no position adoption, no
+    sensor-hold, exactly today's 120s-then-left behaviour."""
+    cfg.assume_identity = False
+    t = OccupancyTracker()
+    t.update("cam", "sala", [_obs("1", _david())], now=0.0)
+    assert _edges(t, "cam", "sala", [], now=10.0) == []
+    assert _edges(t, "cam", "sala", [_obs("2", cx=0.5)], now=20.0) == []
+    assert not any(p.get("assumed") for p in t.snapshot("sala", now=20.0)["sala"])
+    e = t.update("cam", "sala", [_obs("2", cx=0.5)],
+                 now=10.0 + cfg.leave_confirm_s + 1, zone_occupied=True)
+    assert any(x.edge == EDGE_LEFT and x.identity.id == "u1" for x in e)
