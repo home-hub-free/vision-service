@@ -693,15 +693,17 @@ class Gallery:
             finally:
                 conn.close()
 
-    def _best_identity(self, emb: List[float], exclude: Optional[set] = None,
-                       exclude_guest: Optional[str] = None
-                       ) -> Tuple[Optional[str], Optional[str], Optional[str], float, float]:
-        """Best match across EVERY known identity — household members AND named guest
-        clusters — so a named guest ("Abuela") absorbs re-appearances exactly like a
-        member does, instead of every new angle spawning a fresh "Person N". Returns
-        (kind, id, name, best_score, margin); kind is "member"/"guest"/None. `exclude`
-        holds ids (either kind) a reviewer already rejected for this cluster;
-        `exclude_guest` keeps a cluster from matching itself."""
+    def _ranked_identities(self, emb: List[float], exclude: Optional[set] = None,
+                           exclude_guest: Optional[str] = None
+                           ) -> List[Tuple[float, str, str, Optional[str]]]:
+        """EVERY known identity — household members AND named guest clusters —
+        scored against `emb`, sorted best-first: [(score, kind, id, name)]. A named
+        guest ("Abuela") ranks exactly like a member does, so she absorbs
+        re-appearances instead of every new angle spawning a fresh "Person N".
+        `exclude` holds ids (either kind) a reviewer already rejected for this
+        cluster; `exclude_guest` keeps a cluster from matching itself. The full
+        ranking (not just the winner) feeds the review card\'s quick-assign
+        candidate buttons."""
         exclude = exclude or set()
         scored = [(s, "member", uid, name)
                   for s, uid, name in self._member_scores(emb, exclude)]
@@ -715,9 +717,17 @@ class Gallery:
                 scored.append((_cosine(emb, json.loads(blob)), "guest", gid, gname))
         finally:
             conn.close()
+        scored.sort(key=lambda t: t[0], reverse=True)
+        return scored
+
+    def _best_identity(self, emb: List[float], exclude: Optional[set] = None,
+                       exclude_guest: Optional[str] = None
+                       ) -> Tuple[Optional[str], Optional[str], Optional[str], float, float]:
+        """Best match across every known identity (see _ranked_identities). Returns
+        (kind, id, name, best_score, margin); kind is "member"/"guest"/None."""
+        scored = self._ranked_identities(emb, exclude, exclude_guest)
         if not scored:
             return (None, None, None, -1.0, 0.0)
-        scored.sort(key=lambda t: t[0], reverse=True)
         best_s, kind, best_id, best_name = scored[0]
         margin = best_s - scored[1][0] if len(scored) > 1 else float("inf")
         return (kind, best_id, best_name, best_s, margin)
@@ -1182,8 +1192,12 @@ class Gallery:
         for gid, name, sightings, first_seen, last_seen, blob, rejected_raw, thumb, box_raw in rows:
             emb = json.loads(blob)
             rejected = self._parse_rejected(rejected_raw)
-            kind, tid, tname, score, margin = self._best_identity(
-                emb, exclude=rejected, exclude_guest=gid)
+            ranked = self._ranked_identities(emb, exclude=rejected, exclude_guest=gid)
+            if ranked:
+                score, kind, tid, tname = ranked[0]
+                margin = score - ranked[1][0] if len(ranked) > 1 else float("inf")
+            else:
+                kind, tid, tname, score, margin = None, None, None, -1.0, 0.0
             if (not frozen
                     and tid is not None and score >= self._thr("face_autoheal_threshold")
                     and margin >= self._thr("face_autoheal_margin")
@@ -1223,6 +1237,13 @@ class Gallery:
                 "no_face": no_face,
                 "tier": "suggest" if suggested else "unknown",
                 "suggested": suggested,
+                # Ranked one-tap candidates for the card: the most-likely identities
+                # even when nothing clears the suggest threshold — "Who is this?"
+                # still has a best guess worth a button instead of a dropdown dive.
+                "candidates": [
+                    {"kind": k, "id": i, "name": n, "score": round(s, 3)}
+                    for s, k, i, n in ranked[:2]
+                ],
                 "rejected_user_ids": sorted(rejected),
             })
         return {"queue": queue, "healed": healed}
