@@ -9,3 +9,4 @@ data/
 # model weights — auto-downloaded by ultralytics/insightface on first run, not vendored.
 *.pt
 *.onnx
+.claude/
