@@ -30,7 +30,7 @@ import threading
 import time
 from typing import Dict, List, Optional
 
-from . import hub_push, ingest
+from . import gpu_yield, hub_push, ingest
 from .config import cfg
 from .highres import make_highres_sampler
 from .hub_client import Camera
@@ -276,6 +276,8 @@ class CameraWorker(threading.Thread):
             self._last_pipeline = now
             if not self._motion_gate_open(now):
                 continue  # empty scene per the camera's own motion detector — skip inference
+            if gpu_yield.active():
+                continue  # a voice turn owns the GPU for a few seconds (app/gpu_yield.py)
             try:
                 self._run_pipeline(jpeg, now)
             except Exception as e:  # noqa: BLE001 — a bad frame must never kill perception
