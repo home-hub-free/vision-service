@@ -229,6 +229,28 @@ def test_review_queue_buckets_by_confidence_tier():
     _set_tiers(heal=0.5, margin=0.08, suggest=0.2)  # restore defaults
 
 
+def test_review_cards_carry_ranked_candidates():
+    # Quick-assign buttons: every card lists the top-ranked identities even when
+    # nothing clears the suggest bar — a two-member household answers "Who is
+    # this?" with one tap instead of a dropdown dive.
+    _set_tiers(heal=0.999, suggest=0.95)   # nothing heals, nothing suggests
+    g = _g()
+    g.enroll("u1", "David", _vec(1.0))
+    g.enroll("u2", "Ana", _vec(2.0))
+    g.resolve(_mix(1.0, 3.0, 0.6))         # guest:1 — most like David, below suggest
+    card = g.review_queue()["queue"][0]
+    assert card["tier"] == "unknown" and card["suggested"] is None
+    cands = card["candidates"]
+    assert [c["id"] for c in cands] == ["u1", "u2"]
+    assert cands[0]["kind"] == "member" and cands[0]["name"] == "David"
+    assert cands[0]["score"] > cands[1]["score"]
+    # A rejected identity never comes back as a button.
+    g.reject_suggestion("guest:1", "u1")
+    cands = g.review_queue()["queue"][0]["candidates"]
+    assert [c["id"] for c in cands] == ["u2"]
+    _set_tiers(heal=0.5, margin=0.08, suggest=0.2)  # restore defaults
+
+
 def test_resolve_autoheals_cluster_that_drifts_onto_member():
     # Live path: single frames never clear the direct match bar, but merged
     # sightings pull the cluster centroid decisively onto the member → resolve
