@@ -89,11 +89,15 @@ def member_clusters(user_id: str):
 
 
 @router.post("/faces/clusters/{guest_id}/detach")
-def detach_cluster(guest_id: str, authorization=Header(None)):
+def detach_cluster(guest_id: str, reject: bool = Body(True, embed=True),
+                   authorization=Header(None)):
     """"That one wasn't me" — un-merge a cluster from the member it was auto-healed into,
-    block it from healing back, and send it to the review queue for a fresh decision."""
+    block it from healing back, and send it to the review queue for a fresh decision.
+    `reject: false` = the review flow's UNDO of a mis-tapped assign: back to the queue
+    WITHOUT branding the member "not them" (an oops is not a rejection), so the card
+    re-asks with its suggestion intact."""
     require_user(authorization)  # admin-gated
-    member = gallery.detach_cluster(guest_id)
+    member = gallery.detach_cluster(guest_id, reject=reject)
     if member is None:
         raise HTTPException(status_code=404, detail="cluster not found or not a member promotion")
     return {"ok": True, "guest_id": guest_id, "detached_from": member}
