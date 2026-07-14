@@ -1,3 +1,12 @@
+---
+title: AGENTS.md — vision-service
+summary: Read-first orientation for vision-service — first principles (agent never sees frames, one identity space, runnable without ML, biometrics local), layout, conventions.
+status: LIVE
+owner: vision-service
+updated: 2026-06-28
+tags: [vision, camera, agents]
+---
+
 # AGENTS.md — vision-service
 
 Box-side camera perception. Standalone Python service (FastAPI/uvicorn, :8130), its own

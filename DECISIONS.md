@@ -1,3 +1,12 @@
+---
+title: Camera Vision — open decisions
+summary: vision-service open decisions as config knobs with safe defaults (GPU/ROCm, retention, fusion, …) plus the identity-quality + review-loop overhauls and record-scope work.
+status: LIVE
+owner: vision-service
+updated: 2026-07-09
+tags: [vision, camera, decisions]
+---
+
 # Camera Vision — open decisions (stubbed, wired, ready to flip)
 
 Every human decision from CAMERA_VISION_PLAN §11 (and the §9 recording residuals) was

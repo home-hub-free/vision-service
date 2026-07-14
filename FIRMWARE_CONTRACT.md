@@ -1,3 +1,12 @@
+---
+title: ESP32-CAM firmware contract
+summary: The frozen contract ESP32-CAM firmware must honour to slot into the built box side — hardware reality, MJPEG transport, declare stream block, reliability, optional stretch.
+status: LIVE
+owner: vision-service
+updated: 2026-06-28
+tags: [vision, camera, firmware, contract]
+---
+
 # ESP32-CAM firmware contract (handoff to the `devices` repo session)
 
 CAMERA_VISION_PLAN §3 delegates the firmware to the standalone `devices` repo

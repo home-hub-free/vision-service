@@ -1,3 +1,12 @@
+---
+title: vision-service
+summary: Local-first camera perception (:8130) — MJPEG/RTSP readers → person/face → occupancy/identity world-model to the agent; run, milestones, endpoints, contracts, validation spike.
+status: LIVE
+owner: vision-service
+updated: 2026-07-04
+tags: [vision, camera, perception, python]
+---
+
 # vision-service
 
 Local-first camera perception for home-hub. Implements CAMERA_VISION_PLAN.md §4/§9:
