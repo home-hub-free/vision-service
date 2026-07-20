@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import re
 import struct
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
@@ -140,21 +141,102 @@ def thumbnail_jpeg(jpeg: bytes, max_dim: int = 220) -> bytes:
     return encode_jpeg(_resize_max(frame, max_dim)) or jpeg
 
 
+# Overlay palette (BGR) — the dashboard's "Tablero" tokens (_tokens.scss), so the
+# annotated view reads as part of the same UI: ink plates, bone text, one calm
+# accent per identity tier. State is a flat fill + an indicator dot, never a glow.
+_INK = (12, 17, 23)       # #17110c — label plate / keyline under-stroke
+_BONE = (214, 228, 236)   # #ece4d6 — label text
+_SAGE = (128, 169, 116)   # #74a980 — recognized household member
+_STONE = (181, 154, 125)  # #7d9ab5 — "Person N" guest cluster
+_MUTED = (129, 145, 156)  # #9c9181 — unresolved detection
+_CHIP_ALPHA = 0.86
+
+
+def _tier_color(name: str) -> Tuple[int, int, int]:
+    if name in ("person", "unknown"):
+        return _MUTED
+    if re.fullmatch(r"Person \d+", name):
+        return _STONE
+    return _SAGE
+
+
+def _stroked_rect(cv2, frame, p1, p2, color, thickness: int) -> None:
+    """Accent stroke over an ink under-stroke — legible on bright and dark scenes."""
+    cv2.rectangle(frame, p1, p2, _INK, thickness + 2, cv2.LINE_AA)
+    cv2.rectangle(frame, p1, p2, color, thickness, cv2.LINE_AA)
+
+
+def _corner_brackets(cv2, frame, bbox: BBox, color, arm: int, thickness: int) -> None:
+    import numpy as np  # type: ignore
+    x1, y1, x2, y2 = bbox
+    pts = [np.array(c, dtype=np.int32) for c in (
+        [(x1 + arm, y1), (x1, y1), (x1, y1 + arm)],
+        [(x2 - arm, y1), (x2, y1), (x2, y1 + arm)],
+        [(x1 + arm, y2), (x1, y2), (x1, y2 - arm)],
+        [(x2 - arm, y2), (x2, y2), (x2, y2 - arm)],
+    )]
+    cv2.polylines(frame, pts, False, _INK, thickness + 2, cv2.LINE_AA)
+    cv2.polylines(frame, pts, False, color, thickness, cv2.LINE_AA)
+
+
+def _rounded_fill(cv2, img, w: int, h: int, r: int, color) -> None:
+    cv2.rectangle(img, (r, 0), (w - r - 1, h - 1), color, -1)
+    cv2.rectangle(img, (0, r), (w - 1, h - r - 1), color, -1)
+    for cx, cy in ((r, r), (w - r - 1, r), (r, h - r - 1), (w - r - 1, h - r - 1)):
+        cv2.circle(img, (cx, cy), r, color, -1, cv2.LINE_AA)
+
+
+def _label_chip(cv2, frame, bbox: BBox, name: str, color, s: float) -> None:
+    """The name on a translucent ink plate with a tier indicator dot — sits just
+    above the box (falls inside its top edge when clipped by the frame)."""
+    fh, fw = frame.shape[:2]
+    x1, y1, _, _ = bbox
+    font, fscale = cv2.FONT_HERSHEY_SIMPLEX, 0.44 * s
+    fthick = max(1, round(s))
+    (tw, th), baseline = cv2.getTextSize(name, font, fscale, fthick)
+    pad_x, pad_y, gap = round(8 * s), round(5 * s), round(5 * s)
+    dot_r = max(2, round(2.6 * s))
+    cw = tw + dot_r * 2 + gap + pad_x * 2
+    ch = th + baseline + pad_y * 2
+    cx = min(max(x1, 0), max(fw - cw, 0))
+    cy = y1 - ch - round(6 * s)
+    if cy < 0:  # no room above → inside the box, nudged off the keyline
+        cy = min(y1 + round(6 * s), max(fh - ch, 0))
+        cx = min(max(x1 + round(6 * s), 0), max(fw - cw, 0))
+    roi = frame[cy:cy + ch, cx:cx + cw]
+    if roi.size == 0 or roi.shape[0] != ch or roi.shape[1] != cw:
+        return
+    plate = roi.copy()
+    _rounded_fill(cv2, plate, cw, ch, min(round(4 * s), ch // 2, cw // 2), _INK)
+    frame[cy:cy + ch, cx:cx + cw] = cv2.addWeighted(plate, _CHIP_ALPHA, roi, 1 - _CHIP_ALPHA, 0)
+    dot = (cx + pad_x + dot_r, cy + ch // 2)
+    cv2.circle(frame, dot, dot_r, color, -1, cv2.LINE_AA)
+    cv2.putText(frame, name, (dot[0] + dot_r + gap, cy + pad_y + th),
+                font, fscale, _BONE, fthick, cv2.LINE_AA)
+
+
 def draw_overlay(frame, tracks: List[DetectedTrack], labels: dict) -> bytes:
-    """Annotate a frame with boxes + names → JPEG bytes for the dashboard's annotated
-    view (§6). `labels[track_id]` is the resolved display string. cv2-only; the null
-    build never calls this (it relays raw frames)."""
+    """Annotate a frame with the Tablero identity overlay → JPEG bytes for the
+    dashboard's annotated view (§6): a keyline + corner brackets around each person
+    and an ink label chip that stays readable over any scene. Accent = identity
+    tier (sage member / stone-blue guest / muted unresolved). `labels[track_id]` is
+    the resolved display string. cv2-only; the null build never calls this (it
+    relays raw frames)."""
     cv2 = _cv2()
     if cv2 is None or frame is None:
         return b""
+    fh, fw = frame.shape[:2]
+    s = min(2.0, max(0.75, min(fw, fh) / 720))
     for t in tracks:
         x1, y1, x2, y2 = t.bbox
         name = labels.get(t.track_id, "person")
-        known = name not in ("person", "unknown")
-        color = (80, 200, 120) if known else (200, 200, 200)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame, name, (x1, max(0, y1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+        color = _tier_color(name)
+        _stroked_rect(cv2, frame, (x1, y1), (x2, y2), color, max(1, round(s)))
+        arm = min(round(min(max(10 * s, 0.18 * min(x2 - x1, y2 - y1)), 26 * s)),
+                  (x2 - x1) // 2, (y2 - y1) // 2)
+        if arm > 0:
+            _corner_brackets(cv2, frame, t.bbox, color, arm, max(2, round(2 * s)))
+        _label_chip(cv2, frame, t.bbox, name, color, s)
     return encode_jpeg(frame) or b""
 
 
