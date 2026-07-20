@@ -298,6 +298,12 @@ class Config:
     # treated as None (no corroboration → the sensorless 120s behaviour). The worker
     # injects zone_presence.occupied(zone), which is itself already staleness-gated.
     zone_sensor_stale_s: float = field(default_factory=lambda: _f("VISION_ZONE_SENSOR_STALE_S", 30.0))
+    # Frame-independent occupancy reaper period (2026-07-19 ghost fix): the ledger's
+    # sweep used to run only when a camera delivered a frame, so an idle pipeline froze
+    # ghosts in /occupancy forever. A dedicated thread (app/reaper.py) now calls
+    # tracker.reap() this often — pure in-memory, cheap; keep it well under
+    # leave_confirm_s so expiries land on time. 0 disables (frame-driven only).
+    occupancy_reap_s: float = field(default_factory=lambda: _f("VISION_OCCUPANCY_REAP_S", 15.0))
 
     # ── recording (§9) ───────────────────────────────────────────────────────
     # mode: "off" | "continuous" | "gated" | "hybrid" (§9.2; hybrid is the rec default).

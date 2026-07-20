@@ -514,28 +514,49 @@ class OccupancyTracker:
                 continue
             if now - tr.last_seen <= cfg.leave_grace_s:
                 continue
-            entry = self._presence.get((tr.zone, tr.announced_identity or ""))
-            if entry is not None:
-                entry.tracks.discard(tr.key)
-                if not entry.tracks:
-                    if entry.announced:
-                        entry.pending_left_since = now
-                        # SMART_FACE_ID: remember WHERE this last support was and whether
-                        # it walked out (exit) or dropped to stillness — the anchor + gate
-                        # for position-adoption and the sensor-hold. last_seen stays at the
-                        # last VERIFIED sighting for an assumed entry (the dropping track
-                        # was itself only a hypothesis) — never advance it to an unverified
-                        # track's last frame.
-                        if not entry.assumed:
-                            entry.last_seen = tr.last_seen  # when they actually vanished
-                        if tr.norm_bbox is not None:
-                            entry.last_bbox_n = tr.norm_bbox
-                        entry.exit_signature = self._exit_signature(tr)
-                    else:
-                        # A blip that died before it settled — total silence.
-                        del self._presence[(entry.zone, entry.key)]
-            self._adopted.pop(tr.key, None)
-            del self._tracks[key]
+            self._drop_track(tr, now)
+
+    def _drop_track(self, tr: _Track, now: float) -> None:
+        """Retire one aged-out track and let its LEDGER entry react (pending-left) —
+        never a direct edge. Shared by the per-frame `_expire` and the frame-
+        independent `reap` (2026-07-19 ghost fix)."""
+        entry = self._presence.get((tr.zone, tr.announced_identity or ""))
+        if entry is not None:
+            entry.tracks.discard(tr.key)
+            if not entry.tracks:
+                if entry.announced:
+                    entry.pending_left_since = now
+                    # SMART_FACE_ID: remember WHERE this last support was and whether
+                    # it walked out (exit) or dropped to stillness — the anchor + gate
+                    # for position-adoption and the sensor-hold. last_seen stays at the
+                    # last VERIFIED sighting for an assumed entry (the dropping track
+                    # was itself only a hypothesis) — never advance it to an unverified
+                    # track's last frame.
+                    if not entry.assumed:
+                        entry.last_seen = tr.last_seen  # when they actually vanished
+                    if tr.norm_bbox is not None:
+                        entry.last_bbox_n = tr.norm_bbox
+                    entry.exit_signature = self._exit_signature(tr)
+                else:
+                    # A blip that died before it settled — total silence.
+                    del self._presence[(entry.zone, entry.key)]
+        self._adopted.pop(tr.key, None)
+        del self._tracks[tr.key]
+
+    def reap(self, now: Optional[float] = None) -> List[Edge]:
+        """Time-based ledger heartbeat, INDEPENDENT of frame arrival (2026-07-19 ghost
+        fix). `_sweep` used to run only inside `update()` — i.e. only when some camera
+        delivered a frame — so a stalled/offline/privacy-paused pipeline left every
+        pending-left ghost (and the idle camera's live tracks) frozen in the snapshot
+        forever. This is the same sweep `update()` runs, plus a global pass expiring
+        tracks NO camera has reported for leave_grace_s (an idle camera never calls
+        `_expire` for its own zone). Called by the periodic reaper thread (app/reaper.py);
+        emits the same debounced edges update() would, so leaves stay truthful."""
+        now = time.time() if now is None else now
+        for tr in list(self._tracks.values()):
+            if now - tr.last_seen > cfg.leave_grace_s:
+                self._drop_track(tr, now)
+        return self._sweep(now)
 
     def _sweep(self, now: float) -> List[Edge]:
         """Ledger heartbeat, run on every update (any camera): announce entries
@@ -549,19 +570,36 @@ class OccupancyTracker:
                     now - entry.pending_left_since < cfg.leave_confirm_s:
                 continue
             # Past the leave-confirm window. SMART_FACE_ID sensor-corroborated hold: a
-            # NAMED, dropout-signature ghost is HELD as an assumed-present entry (no left
-            # edge) while the zone's mmWave/PIR still reads occupied — vision lost the
-            # track to stillness but the sensor says someone is here. Anything else (an
-            # unknown, an exit-signature walk-out, a just-reverted entry inside its block,
-            # or a zone whose sensor reads empty / stale / None) confirms left promptly,
-            # exactly as before. Zones with no sensor (None) keep the 120s behaviour.
-            if (cfg.assume_identity and entry.identity.id and not entry.exit_signature
+            # HOUSEHOLD, dropout-signature ghost is HELD as an assumed-present entry (no
+            # left edge) while the zone's mmWave/PIR still reads occupied — vision lost
+            # the track to stillness but the sensor says someone is here. Anything else
+            # (an unknown, a guest, an exit-signature walk-out, a just-reverted entry
+            # inside its block, or a zone whose sensor reads empty / stale / None)
+            # confirms left promptly, exactly as before. Zones with no sensor (None)
+            # keep the 120s behaviour.
+            #
+            # 2026-07-19 ghost fix — two hard bounds this hold was missing:
+            #   * household-only (`cls`, not a truthy id): a conf-0.2 `guest:<n>` cluster
+            #     is a noise hypothesis, not a verified person — held guests piled up
+            #     ~109 immortal ghosts in sala (each flapped guest track mints a FRESH
+            #     key, so they never heal into each other, and any one real person kept
+            #     the zone sensor reading occupied → held forever);
+            #   * a TTL: the hold now expires after assume_max_s of coasting without a
+            #     verifying face read — the same window the confidence decay is
+            #     documented against (by then we're at the floor: stop believing). The
+            #     sensor corroborates "someone is here", never "THIS person is here",
+            #     so it must not sustain a name indefinitely.
+            if (cfg.assume_identity and entry.identity.cls == "household"
+                    and not entry.exit_signature
                     and now >= entry.adopt_block_until
                     and self._zone_sensor_state(entry.zone, now) is True):
                 if not entry.assumed:
                     entry.assumed = True
                     entry.assumed_since = now
-                continue
+                if now - entry.assumed_since < cfg.assume_max_s:
+                    continue
+                # else: fall through — held past the coast window, confirm the leave
+                # (truthfully stamped at the last VERIFIED sighting).
             edges.extend(self._confirm_left(entry, now))
         self._recompute_zones(edges, now)
         return edges

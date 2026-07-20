@@ -21,6 +21,7 @@ from .config import cfg
 from .face_audit import FaceAuditor
 from .ingest import init_ingestion
 from .perception import annotate_face_in_thumb
+from .reaper import OccupancyReaper
 from .retention import Janitor
 from .routes import (camctl, enroll, gpuyield, guests, imaging, occupancy, privacy, ptz,
                      recordings, streams)
@@ -30,11 +31,12 @@ from .supervisor import Supervisor
 _supervisor: Supervisor | None = None
 _janitor: Janitor | None = None
 _face_auditor: FaceAuditor | None = None
+_reaper: OccupancyReaper | None = None
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global _supervisor, _janitor, _face_auditor
+    global _supervisor, _janitor, _face_auditor, _reaper
     init_ingestion()
     # Legacy guest thumbs (full-person crops) get their face located lazily at
     # review time — wire the perception-backed annotator into the gallery here so
@@ -44,6 +46,10 @@ async def lifespan(_app: FastAPI):
     _supervisor.start()
     _janitor = Janitor(index)
     _janitor.start()
+    # Frame-independent occupancy sweep (2026-07-19 ghost fix): leaves/expiries
+    # confirm on time even when no camera is delivering frames.
+    _reaper = OccupancyReaper()
+    _reaper.start()
     if cfg.face_audit_interval_s > 0:
         # Gallery audit + smear alarm (face_audit.py): the tripwire that freezes
         # silent folds when two member profiles start reading confusably alike.
@@ -60,6 +66,8 @@ async def lifespan(_app: FastAPI):
             _janitor.stop()
         if _face_auditor:
             _face_auditor.stop()
+        if _reaper:
+            _reaper.stop()
 
 
 app = FastAPI(title="home-hub vision-service", lifespan=lifespan)

@@ -354,3 +354,101 @@ def test_kill_switch_off_disables_adoption_and_sensor_hold():
     e = t.update("cam", "sala", [_obs("2", cx=0.5)],
                  now=10.0 + cfg.leave_confirm_s + 1, zone_occupied=True)
     assert any(x.edge == EDGE_LEFT and x.identity.id == "u1" for x in e)
+
+# ── Ghost expiry (2026-07-19 live-defect fix — DATA_INTEGRITY_FOUNDATION Phase 1.5) ─
+# Observed live: sala accumulated ~109 immortal ghosts (pending_left+assumed entries,
+# guest dwells past 53h) because (a) the sensor-hold had NO lifetime and any one real
+# person kept the zone sensor occupied, (b) conf-0.2 `guest:<n>` clusters counted as
+# "named" for the hold, and (c) the sweep only ran on frame arrival, so an idle camera
+# never reaped anything. These pin the three bounds.
+
+
+def _guest():
+    return Identity(id="guest:7", name=None, cls="guest", confidence=0.2)
+
+
+def test_sensor_hold_expires_after_assume_max_s_even_if_sensor_stays_occupied():
+    """A household ghost is held by the occupied sensor only for assume_max_s of
+    unverified coasting; past that window it confirms left (truthful last-seen ts)
+    even though the sensor STILL reads occupied — the sensor says 'someone is here',
+    never 'David is here', so it must not sustain a name indefinitely."""
+    t = OccupancyTracker()
+    t.update("cam", "sala", [_obs("1", _david())], now=0.0)
+    t.update("cam", "sala", [_obs("1", _david())], now=30.0)
+    t.update("cam", "sala", [], now=40.0, zone_occupied=True)      # dropout: pending-left
+    hold_at = 40.0 + cfg.leave_confirm_s + 1
+    assert _edges(t, "cam", "sala", [], now=hold_at, zone_occupied=True) == []  # held
+    snap = t.snapshot("sala", now=hold_at)["sala"]
+    assert snap[0]["assumed"] is True and snap[0]["pending_left"] is True
+    # Still held mid-window…
+    assert _edges(t, "cam", "sala", [],
+                  now=hold_at + cfg.assume_max_s - 10, zone_occupied=True) == []
+    # …but past assume_max_s of coasting the hold expires — sensor occupied or not.
+    e = t.update("cam", "sala", [], now=hold_at + cfg.assume_max_s + 1, zone_occupied=True)
+    lefts = [x for x in e if x.edge == EDGE_LEFT]
+    assert len(lefts) == 1 and lefts[0].identity.id == "u1" and lefts[0].ts == 30.0
+    assert t.snapshot("sala") == {}
+
+
+def test_guest_ghost_is_never_sensor_held():
+    """A low-confidence guest cluster (`guest:<n>`, conf ~0.2) is a noise hypothesis,
+    not a verified person: an occupied sensor must NOT hold its ghost — it confirms
+    left at leave_confirm_s exactly like the sensorless case. (Live: every flapped
+    guest track mints a FRESH guest key, so held guests never healed — they piled up.)"""
+    t = OccupancyTracker()
+    assert _edges(t, "cam", "sala", [_obs("1", _guest())], now=0.0) == \
+        [EDGE_ENTERED, EDGE_GUEST_ARRIVED]
+    t.update("cam", "sala", [_obs("1", _guest())], now=30.0)
+    t.update("cam", "sala", [], now=40.0, zone_occupied=True)      # dropout: pending-left
+    e = t.update("cam", "sala", [], now=40.0 + cfg.leave_confirm_s + 1, zone_occupied=True)
+    lefts = [x for x in e if x.edge == EDGE_LEFT]
+    assert len(lefts) == 1 and lefts[0].identity.id == "guest:7" and lefts[0].ts == 30.0
+    assert not any(p.get("assumed")
+                   for z in t.snapshot(now=40.0 + cfg.leave_confirm_s + 1).values() for p in z)
+    assert t.snapshot("sala") == {}
+
+
+def test_reap_confirms_stuck_pending_left_without_any_frames():
+    """A ghost already pending-left expires via reap() alone — zero update() calls —
+    with the same truthful left + room_empty a frame-driven sweep would emit."""
+    t = OccupancyTracker()
+    t.update("cam", "sala", [_obs("1", _david())], now=0.0)
+    t.update("cam", "sala", [_obs("1", _david())], now=30.0)
+    t.update("cam", "sala", [], now=40.0)                          # pending-left at 40
+    # Inside the window reap is silent (debounce intact) and the ghost still shows.
+    assert [e.edge for e in t.reap(now=40.0 + cfg.leave_confirm_s - 5)] == []
+    assert t.snapshot("sala", now=100.0)["sala"][0]["pending_left"] is True
+    e = t.reap(now=40.0 + cfg.leave_confirm_s + 1)
+    assert [x.edge for x in e] == [EDGE_LEFT, EDGE_ROOM_EMPTY]
+    assert next(x for x in e if x.edge == EDGE_LEFT).ts == 30.0
+    assert t.snapshot("sala") == {}
+
+
+def test_reap_expires_tracks_of_an_idle_camera():
+    """A camera that stops calling update() entirely (offline/stalled reader) used to
+    leave its live tracks — and the ledger entries they support — frozen forever.
+    reap() ages those tracks out globally, then runs the normal pending→left path."""
+    t = OccupancyTracker()
+    t.update("cam", "sala", [_obs("1", _david())], now=0.0)        # …then the camera dies
+    edges = t.reap(now=50.0)                                       # past leave_grace_s
+    assert [e.edge for e in edges] == []                           # silent: pending, not left
+    snap = t.snapshot("sala", now=50.0)["sala"]
+    assert snap[0]["name"] == "David" and snap[0]["pending_left"] is True
+    e = t.reap(now=50.0 + cfg.leave_confirm_s + 1)
+    assert [x.edge for x in e] == [EDGE_LEFT, EDGE_ROOM_EMPTY]
+    assert next(x for x in e if x.edge == EDGE_LEFT).ts == 0.0     # last actually seen
+    assert t.snapshot("sala") == {}
+
+
+def test_reap_does_not_regress_flap_healing():
+    """The person-level debounce survives the reaper: a reap inside the leave-confirm
+    window emits nothing, and a re-detection after that reap still heals with ZERO
+    edges and continuous dwell — reap must never turn a dropout into a false leave."""
+    t = OccupancyTracker()
+    t.update("cam", "sala", [_obs("1", _david())], now=0.0)
+    t.update("cam", "sala", [], now=10.0)                          # dropout: pending-left
+    assert [e.edge for e in t.reap(now=60.0)] == []                # mid-window: silent
+    assert _edges(t, "cam", "sala", [_obs("2", _david())], now=80.0) == []  # heals, silent
+    assert t.snapshot("sala", now=81.0)["sala"][0]["since"] == 0.0  # dwell continuous
+    assert [e.edge for e in t.reap(now=85.0)] == []                # live track: untouched
+    assert t.snapshot("sala", now=85.0)["sala"][0].get("pending_left") is None
