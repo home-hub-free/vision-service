@@ -108,3 +108,84 @@ def test_merge_folds_cluster_into_named_guest(gallery):
     res = client.post("/guests/guest:2/merge", json={"into": "guest:1"})
     assert res.status_code == 200 and res.json()["merged_into"] == "guest:1"
     assert client.post("/guests/guest:2/merge", json={"into": "guest:1"}).status_code == 404
+
+
+# ── review-queue triage ("Clean up") ─────────────────────────────────────────
+def test_triage_lists_unidentifiable_cards_and_applies_only_when_complete(gallery, monkeypatch):
+    cfg.face_triage_keep_sightings = 3
+    gallery.resolve(_vec(2.0), thumb=b"SHARP", thumb_box=[0.3, 0.2, 0.4, 0.5])   # guest:1 ok
+    gallery.resolve(_vec(3.0), thumb=b"BLUR", thumb_box=[0.3, 0.2, 0.4, 0.5])    # guest:2 blurry
+    gallery.resolve(_vec(4.0), thumb=b"NOFACE", thumb_box=[0.3, 0.2, 0.4, 0.5])  # guest:3 no face
+    gallery.resolve(_vec(5.0))                                                   # guest:4 no photo
+    for _ in range(3):                                                           # guest:5 recurring
+        gallery.resolve(_vec(6.0), thumb=b"NOFACE", thumb_box=[0.3, 0.2, 0.4, 0.5])
+    verdict = {b"SHARP": "ok", b"BLUR": "blurry", b"NOFACE": "no_face"}
+    calls = []
+    gallery.thumb_assessor = lambda jpeg: calls.append(jpeg) or verdict[jpeg]
+
+    body = client.post("/people/review/triage", json={}).json()
+    assert body["complete"] is True and body["applied"] == 0
+    assert body["total"] == 5 and body["kept"] == 1 and body["kept_recurring"] == 1
+    assert {d["guest_id"]: d["reason"] for d in body["discard"]} == {
+        "guest:2": "blurry", "guest:3": "no_face", "guest:4": "no_photo"}
+    assert body["reasons"] == {"blurry": 1, "no_face": 1, "no_photo": 1}
+    assert sorted(calls) == [b"BLUR", b"NOFACE", b"SHARP"]   # recurring never judged
+    # Dry run never deletes; verdicts are cached so the second pass judges nothing.
+    assert len(gallery.review_queue()["queue"]) == 5
+    calls.clear()
+    assert client.post("/people/review/triage", json={}).json()["complete"] is True
+    assert calls == []
+
+    # Apply discards exactly the listed cards; the ok + recurring ones survive.
+    body = client.post("/people/review/triage", json={"apply": True}).json()
+    assert body["applied"] == 3
+    left = {c["guest_id"] for c in gallery.review_queue()["queue"]}
+    assert left == {"guest:1", "guest:5"}
+    cfg.face_triage_keep_sightings = 3
+
+
+def test_triage_respects_budget_and_never_applies_a_partial_scan(gallery, monkeypatch):
+    import types
+    from app import gallery as gallery_module
+    for i in range(3):
+        gallery.resolve(_vec(float(i + 2)), thumb=b"X%d" % i, thumb_box=[0.3, 0.2, 0.4, 0.5])
+    ticks = iter([0.0, 0.0, 100.0])                         # budget blows after the 1st judge
+    gallery.thumb_assessor = lambda jpeg: "no_face"
+    # Patch the module's clock (not time.monotonic globally — the test client's own
+    # event loop reads that clock too and would eat the ticks); scoped so the
+    # fixture's own patches (auth stub, temp gallery) survive the second call.
+    with pytest.MonkeyPatch.context() as clock:
+        clock.setattr(gallery_module, "time",
+                      types.SimpleNamespace(monotonic=lambda: next(ticks, 100.0)))
+        body = client.post("/people/review/triage", json={"apply": True, "budget_s": 5}).json()
+    assert body["complete"] is False and body["pending"] == 2 and body["scanned"] == 1
+    assert body["applied"] == 0 and len(body["discard"]) == 1
+    assert len(gallery.review_queue()["queue"]) == 3           # nothing deleted on a partial pass
+    body = client.post("/people/review/triage", json={"apply": True}).json()
+    assert body["complete"] is True and body["applied"] == 3
+
+
+def test_triage_without_engine_judges_nothing_and_requires_auth(gallery, monkeypatch):
+    gallery.resolve(_vec(2.0), thumb=b"CROP", thumb_box=[0.3, 0.2, 0.4, 0.5])
+    gallery.thumb_assessor = None                               # null build
+    body = client.post("/people/review/triage", json={"apply": True}).json()
+    assert body["complete"] is False and body["unjudged"] == 1 and body["applied"] == 0
+    gallery.thumb_assessor = lambda jpeg: None                  # engine down right now
+    assert client.post("/people/review/triage", json={}).json()["unjudged"] == 1
+    from fastapi import HTTPException
+
+    def unauthed(authorization):
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    monkeypatch.setattr(guests_routes, "require_user", unauthed)
+    assert client.post("/people/review/triage", json={}).status_code == 401
+
+
+def test_triage_verdict_resets_when_a_bad_thumb_is_replaced(gallery):
+    cfg.guest_cluster_threshold = 0.5                            # let the 2nd sighting cluster
+    gallery.resolve(_vec(2.0), thumb=b"BAD", thumb_box=[])     # stored crop: no face
+    gallery.thumb_assessor = lambda jpeg: "no_face" if jpeg == b"BAD" else "ok"
+    assert gallery.triage_review()["discard"][0]["reason"] == "no_face"
+    gallery.resolve(_vec(2.0), thumb=b"GOOD", thumb_box=[0.3, 0.2, 0.4, 0.5])  # self-heal
+    body = gallery.triage_review()
+    assert body["discard"] == [] and body["kept"] == 1
+    cfg.guest_cluster_threshold = 0.999999

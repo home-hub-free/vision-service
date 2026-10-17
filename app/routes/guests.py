@@ -8,6 +8,7 @@ model) name a person or promote them into a household member's face gallery.
 
   GET    /people                    — EVERY labelled person (household + guests) + faces
   GET    /people/review             — the "Is this you?" queue (tiers; auto-heals on read)
+  POST   /people/review/triage      — {apply?, budget_s?} → list/discard unidentifiable cards [auth]
   GET    /guests?recurring=1        — guest clusters only (back-compat)
   POST   /guests/{id}/promote       — {user_id, name} → into a household member's gallery   [auth]
   POST   /guests/{id}/name          — {name} → name a guest WITHOUT promoting (stays guest) [auth]
@@ -51,6 +52,21 @@ def people_review():
     for card in result["queue"]:
         card["thumb"] = f"faces/thumb/{card['guest_id']}" if card.get("has_thumb") else None
     return result
+
+
+@router.post("/people/review/triage")
+def review_triage(apply: bool = Body(False, embed=True),
+                  budget_s: float = Body(15.0, embed=True),
+                  authorization: Optional[str] = Header(None)):
+    """The banner's "Clean up" button. A months-old backlog is mostly crops no
+    human can identify (no detectable face, too small, blurry, turned away) — the
+    same faces the identity gate would never use. Dry run (default) re-judges each
+    queued thumbnail, caching verdicts, within `budget_s` seconds and reports what it
+    would discard; the dashboard keeps calling until `complete`, shows the count, and
+    only then sends `apply: true` to delete them. Recurring clusters are never
+    touched. Auth-gated like every other labeling write."""
+    require_user(authorization)
+    return gallery.triage_review(apply=apply, budget_s=max(1.0, min(60.0, budget_s)))
 
 
 @router.get("/guests")

@@ -54,6 +54,7 @@ dashboard plumbing. Identity lights up when a real backend is installed (see bel
 | `POST /faces/enroll` · `/faces/forget` · `GET /faces/profiles` | Face-ID enrollment (dashboard, bearer-auth) |
 | `GET /people` · `GET /faces/thumb/{id}` | every labelled person (household + default-id'd guests) + their captured face |
 | `POST /guests/{id}/name` · `/guests/{id}/promote` · `DELETE /guests/{id}` | admin labels a person / links to a member (bearer-auth) |
+| `POST /people/review/triage` | "Clean up": list (dry run) / discard (`apply`) review cards no human could identify (bearer-auth) |
 
 **Label everyone by default + surface faces (§6):** every detected person is
 auto-labelled with a stable id (`guest:N`) + a friendly "Person N" label + a captured

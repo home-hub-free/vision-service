@@ -83,6 +83,31 @@ of promoted-path IDs were noise faces < 0.20 vs the member's anchors):
   recurs (thumb self-heals then). Also: the ledger `reinforced` flag now records an
   ACTUAL fold, not intent (anchored members never fold).
 
+## Review-queue triage — "Clean up" (BUILT 2026-10-17)
+A review queue left alone for months is mostly unanswerable: of 797 queued cards on
+2026-10-17, 300 thumbnails held no detectable face at all and 227 more failed the live
+identity gate (216 low detector confidence, 10 turned away, 1 blurry); only 11 clusters
+had recurred 3+ times. Asking a human to swipe through those is wasted effort — the
+pipeline itself would never use such a face. So Settings → People gets an explicit
+**Clean up** button next to **Review** (`POST /people/review/triage`, auth-gated):
+- **Same bar as the pipeline.** `perception.assess_thumb` re-judges the stored thumb
+  with the LIVE gate (`face_min_det_score` / yaw / pitch / `face_min_sharpness`) plus
+  the `face_min_px` floor; verdicts are `ok` / `no_face` / `too_small` /
+  `low_confidence` / `off_angle` / `blurry`, and a card with no photo is `no_photo`.
+  Not the enroll gate — that would flag ~88% including identifiable faces.
+- **Cached, resumable, dry-run first.** Verdicts cache in `guests.thumb_quality`
+  (NULL = unjudged; reset by the thumb-replacing UPDATE in `_cluster_guest`, so a
+  self-healed thumb is re-judged). Judging costs ~0.26 s/thumb on CPU, so each call
+  judges for `budget_s` (default 15 s) and reports `complete`/`pending`; the dashboard
+  re-calls until complete, shows "N of M unidentifiable", and only then sends
+  `apply: true`. The server refuses to apply on a partial scan.
+- **Recurring people are never touched.** `face_triage_keep_sightings` (3): a cluster
+  seen that often is a real visitor whose thumb self-heals on the next face-located
+  sighting. Applying is plain `DELETE` — identical to the card's Discard button; a
+  discarded person re-enters review with a fresh crop if seen again.
+- **Null build judges nothing.** No engine → `thumb_assessor` returns None →
+  `unjudged`, never discarded on a guess.
+
 ## Footage review + record scope (BUILT 2026-07-04)
 The §9.5 review surface is now built end-to-end (was: recorder + index existed, but no
 way to browse/play archived clips and every camera recorded).

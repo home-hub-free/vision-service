@@ -131,3 +131,18 @@ def test_enroll_route_maps_reason_to_actionable_422(monkeypatch):
                         lambda data: (None, "multiple_faces"))
     r = client.post("/faces/enroll", files={"image": ("f.jpg", io.BytesIO(b"\xff\xd8x"), "image/jpeg")})
     assert r.status_code == 422 and "one person" in r.json()["detail"]
+
+
+def test_assess_thumb_reasons():
+    _reset_gates()
+    frame = _sharp_frame()
+    assert _engine([]).assess_thumb(frame) == "no_face"
+    cfg.face_min_px = 72
+    assert _engine([_Face(bbox=(0, 0, 60, 60))]).assess_thumb(frame) == "too_small"
+    assert _engine([_Face(det=0.5)]).assess_thumb(frame) == "low_confidence"
+    assert _engine([_Face(pose=(0.0, 60.0, 0.0))]).assess_thumb(frame) == "off_angle"
+    assert _engine([_Face()]).assess_thumb(_flat_frame()) == "blurry"
+    assert _engine([_Face()]).assess_thumb(frame) == "ok"
+    # Null engine (no model) can't judge → None, so triage leaves the card alone.
+    from app.perception import NullFaceEngine
+    assert NullFaceEngine().assess_thumb(frame) is None

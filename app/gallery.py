@@ -24,7 +24,7 @@ import re
 import sqlite3
 import threading
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .config import cfg
 from .occupancy import Identity
@@ -63,6 +63,11 @@ class Gallery:
         # box within the thumb, [] for "no face found", None for "engine unavailable".
         # Used to lazily locate the face in LEGACY person-crop thumbs at review time.
         self.thumb_annotator = None
+        # Optional hook (wired at startup to perception.assess_thumb_quality):
+        # (thumb_jpeg) → "ok" | reason string, or None for "engine unavailable".
+        # Drives review-queue triage (`triage_review`); verdicts cache in
+        # guests.thumb_quality and reset whenever the thumb is replaced.
+        self.thumb_assessor = None
         # Capture-ledger folder: alongside THIS gallery's DB unless overridden, so a
         # temp-DB gallery (tests) never writes crops into the production data dir.
         self.captures_dir = cfg.captures_dir or os.path.join(
@@ -106,6 +111,10 @@ class Gallery:
             # NULL = not known yet (legacy thumb, annotated lazily); "[]" = the engine
             # looked and found no face (don't re-run).
             self._ensure_column(conn, "guests", "thumb_box", "TEXT")
+            # Cached triage verdict for the stored thumb ("ok" or a reason — see
+            # `triage_review`); NULL = not judged yet. Travels with the thumb: the
+            # thumb-replacing UPDATE in _cluster_guest resets it.
+            self._ensure_column(conn, "guests", "thumb_quality", "TEXT")
             # Who promoted this cluster into its member: 'human' (a deliberate "yes,
             # it's me" from the review flow) or 'auto' (autoheal folded it in). The
             # scheduled auditor re-scores promotions against anchors and detaches the
@@ -767,12 +776,15 @@ class Gallery:
                                    thumb_box=CASE WHEN thumb IS NULL
                                        OR ((thumb_box IS NULL OR thumb_box='[]') AND ? IS NOT NULL)
                                        THEN ? ELSE thumb_box END,
+                                   thumb_quality=CASE WHEN thumb IS NULL
+                                       OR ((thumb_box IS NULL OR thumb_box='[]') AND ? IS NOT NULL)
+                                       THEN NULL ELSE thumb_quality END,
                                    thumb=CASE WHEN thumb IS NULL
                                        OR ((thumb_box IS NULL OR thumb_box='[]') AND ? IS NOT NULL)
                                        THEN ? ELSE thumb END,
                                    last_seen=datetime('now') WHERE guest_id=?""",
                             (json.dumps(merged), best_n + 1,
-                             box_json, box_json, box_json, thumb, best_id),
+                             box_json, box_json, box_json, box_json, thumb, best_id),
                         )
                     else:
                         conn.execute(
@@ -1247,6 +1259,87 @@ class Gallery:
                 "rejected_user_ids": sorted(rejected),
             })
         return {"queue": queue, "healed": healed}
+
+    def triage_review(self, apply: bool = False, budget_s: float = 15.0) -> dict:
+        """Review-queue triage — the "Clean up" button. Re-judges every queued
+        cluster's stored thumbnail with `thumb_assessor` (the live identity gate +
+        size floor, see perception.assess_thumb) and lists the ones no human could
+        identify either: no detectable face, too small, blurry, turned away, low
+        detector confidence, or no photo at all. Verdicts cache in
+        `guests.thumb_quality` (reset when the thumb is replaced), so the scan is
+        resumable: it stops after `budget_s` seconds of fresh judging and reports
+        `complete: False` + `pending`; the caller re-calls until complete (each call
+        picks up where the cache ends). Recurring clusters (sightings ≥
+        `face_triage_keep_sightings`) are never listed — a real person's thumb
+        self-heals on their next face-located sighting.
+
+        `apply=True` deletes the listed clusters — but only once the scan is
+        complete, so a partial pass can never discard on an unjudged backlog.
+        Deleting is the same thing the card's Discard button does: a discarded
+        person simply re-enters review with a fresh crop if the camera sees them
+        again. Dry run by default; the dashboard shows the count and asks."""
+        keep_min = int(self._thr("face_triage_keep_sightings"))
+        conn = self._db()
+        try:
+            rows = conn.execute(
+                """SELECT guest_id, sightings, thumb, thumb_quality
+                   FROM guests WHERE promoted_user_id IS NULL AND name IS NULL
+                   ORDER BY last_seen DESC""").fetchall()
+        finally:
+            conn.close()
+        started = time.monotonic()
+        discard: List[dict] = []
+        reasons: Dict[str, int] = {}
+        kept = kept_recurring = unjudged = pending = 0
+        verdicts: List[Tuple[str, str]] = []  # (quality, guest_id) to cache
+        for gid, sightings, thumb, quality in rows:
+            if sightings >= keep_min:
+                kept_recurring += 1
+                continue
+            if thumb is None:
+                quality = "no_photo"
+            elif quality is None:
+                if self.thumb_assessor is None:
+                    unjudged += 1
+                    continue
+                if time.monotonic() - started > budget_s:
+                    pending += 1
+                    continue
+                try:
+                    quality = self.thumb_assessor(thumb)
+                except Exception:  # noqa: BLE001 — triage is advisory, never crash review
+                    quality = None
+                if quality is None:  # engine unavailable right now — judge later
+                    unjudged += 1
+                    continue
+                verdicts.append((quality, gid))
+            if quality == "ok":
+                kept += 1
+                continue
+            reasons[quality] = reasons.get(quality, 0) + 1
+            discard.append({"guest_id": gid, "sightings": sightings, "reason": quality})
+        complete = pending == 0 and unjudged == 0
+        applied = 0
+        with _lock:
+            conn = self._db()
+            try:
+                conn.executemany("UPDATE guests SET thumb_quality=? WHERE guest_id=?", verdicts)
+                if apply and complete and discard:
+                    ids = [d["guest_id"] for d in discard]
+                    conn.executemany("DELETE FROM guests WHERE guest_id=?", [(i,) for i in ids])
+                    applied = len(ids)
+                conn.commit()
+            finally:
+                conn.close()
+        if applied:
+            print(f"[vision] review triage discarded {applied} unidentifiable cluster(s): "
+                  f"{reasons}", flush=True)
+        return {
+            "total": len(rows), "scanned": len(rows) - pending - unjudged,
+            "pending": pending, "unjudged": unjudged, "complete": complete,
+            "kept": kept, "kept_recurring": kept_recurring,
+            "discard": discard, "reasons": reasons, "applied": applied,
+        }
 
     def _face_box_for(self, guest_id: str, thumb: Optional[bytes],
                       box_raw: Optional[str],

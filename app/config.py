@@ -177,6 +177,14 @@ class Config:
     enroll_max_yaw: float = field(default_factory=lambda: _f("VISION_ENROLL_MAX_YAW", 30.0))
     enroll_max_pitch: float = field(default_factory=lambda: _f("VISION_ENROLL_MAX_PITCH", 25.0))
     enroll_min_sharpness: float = field(default_factory=lambda: _f("VISION_ENROLL_MIN_SHARPNESS", 60.0))
+    # Review-queue triage ("Clean up" in Settings → People): re-judges every queued
+    # cluster's stored thumbnail against the LIVE gate above (+ face_min_px) and
+    # offers to discard the ones no human could identify either — no detectable
+    # face, too small, too blurry, turned away, low detector confidence. A cluster
+    # seen at least this many times is a recurring person and is always kept (its
+    # thumb self-heals on the next face-located sighting). Measured 2026-10-17 on a
+    # 797-card backlog: 300 no-face + 227 gate failures, 11 recurring clusters.
+    face_triage_keep_sightings: int = field(default_factory=lambda: _i("VISION_FACE_TRIAGE_KEEP_SIGHTINGS", 3))
     # A member's profile is their ANCHOR SET: individually-stored, immutable enroll
     # embeddings; matching scores against the top-k nearest anchors, and nothing that
     # happens at runtime (matches, promotions, autoheal) ever mutates them. The cap

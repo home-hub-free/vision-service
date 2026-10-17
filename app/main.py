@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from .config import cfg
 from .face_audit import FaceAuditor
 from .ingest import init_ingestion
-from .perception import annotate_face_in_thumb
+from .perception import annotate_face_in_thumb, assess_thumb_quality
 from .reaper import OccupancyReaper
 from .retention import Janitor
 from .routes import (camctl, enroll, gpuyield, guests, imaging, occupancy, privacy, ptz,
@@ -42,6 +42,7 @@ async def lifespan(_app: FastAPI):
     # review time — wire the perception-backed annotator into the gallery here so
     # gallery.py itself stays free of cv2/model imports (null-build posture).
     gallery.thumb_annotator = annotate_face_in_thumb
+    gallery.thumb_assessor = assess_thumb_quality  # review-queue triage ("Clean up")
     _supervisor = Supervisor()
     _supervisor.start()
     _janitor = Janitor(index)

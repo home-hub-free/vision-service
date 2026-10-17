@@ -524,6 +524,9 @@ class NullFaceEngine:
     def faces(self, frame) -> List[Tuple[List[float], BBox]]:
         return []
 
+    def assess_thumb(self, frame) -> Optional[str]:
+        return None
+
 
 class _InsightFaceEngine:
     """SCRFD detect + ArcFace (buffalo_l) embed → 512-d normalised vector (§4.2).
@@ -623,6 +626,22 @@ class _InsightFaceEngine:
             return None, "no_face"
         return emb.tolist(), None
 
+    def assess_thumb(self, frame) -> Optional[str]:
+        """Is a stored review thumbnail identifiable? "ok", or why not: "no_face"
+        (detector finds nothing in the crop), "too_small" (largest face under
+        `face_min_px` — the live floor), or the live gate's own reason
+        (low_confidence / off_angle / blurry). The LIVE bars, not the enroll ones:
+        the question is "could this face ever drive an identity decision", which
+        is the same bar the pipeline holds live faces to — anything under it is
+        noise the gallery would never use, so a human needn't look at it either."""
+        faces = self._app.get(frame)
+        if not faces:
+            return "no_face"
+        main = max(faces, key=lambda f: max(f.bbox[2] - f.bbox[0], f.bbox[3] - f.bbox[1]))
+        if max(main.bbox[2] - main.bbox[0], main.bbox[3] - main.bbox[1]) < cfg.face_min_px:
+            return "too_small"
+        return face_quality_reason(main, frame) or "ok"
+
 
 # ── factories (graceful fallback to null) ─────────────────────────────────────
 def make_detector():
@@ -696,6 +715,19 @@ def annotate_face_in_thumb(jpeg: bytes, centroid: List[float]) -> Optional[List[
     x1, y1, x2, y2 = best[1]
     return [round(x1 / w, 4), round(y1 / h, 4),
             round((x2 - x1) / w, 4), round((y2 - y1) / h, 4)]
+
+
+def assess_thumb_quality(jpeg: bytes) -> Optional[str]:
+    """Gallery `thumb_assessor` hook (review-queue triage): "ok" / a reason string
+    for a stored thumbnail, or None when no real engine is loaded (null build —
+    leave unjudged, never discard on a guess). An undecodable blob is "no_face"."""
+    eng = _get_shared_face_engine()
+    if getattr(eng, "backend", "null") == "null":
+        return None
+    frame = decode_jpeg(jpeg)
+    if frame is None:
+        return "no_face"
+    return eng.assess_thumb(frame)
 
 
 def enroll_embedding(jpeg: bytes) -> Tuple[Optional[List[float]], Optional[str]]:
